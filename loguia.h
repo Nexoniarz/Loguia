@@ -4169,7 +4169,7 @@ static int lg__edit(unsigned int id, const char *label, char *buf, int cap, int 
             int digits = 2, n;
             for (i = 0; i < len; i++) lines += buf[i] == '\n';
             for (n = lines; n >= 100; n /= 10) digits++;
-            gutter = (float)digits * lg__text_w("0", "0" + 1) + 2 * s->padding_x;
+            gutter = (float)digits * lg__text_w("0", &"0"[1]) + 2 * s->padding_x;
         }
         r = lg__r(b->inner.x, b->inner.y, b->lay.x1 + b->pad - b->inner.x, b->inner.h);     /* all but the scrollbar */
         in = lg__r(b->lay.x0 + gutter, b->lay.cy, lg__max(1, b->lay.x1 - b->lay.x0 - gutter), lh);
@@ -4357,7 +4357,7 @@ static int lg__edit(unsigned int id, const char *label, char *buf, int cap, int 
         if (y + lh > cl.y && y < cl.y + cl.h) {         /* only the rows that can be seen */
             if (focused && sa != sb && sa <= e && sb >= a) {
                 float x0 = lg__text_w(buf + a, buf + (sa > a ? sa : a)), x1 = lg__text_w(buf + a, buf + (sb < e ? sb : e));
-                if (sb > e) x1 += lg__text_w(" ", " " + 1) / 2;     /* the line end is selected too */
+                if (sb > e) x1 += lg__text_w(" ", &" "[1]) / 2;     /* the line end is selected too */
                 lg__fill(lg__r(in.x - scroll + x0, y, x1 - x0, lh), lg__col(LG_COL_TEXT_SELECT));
             }
             lg__text(in.x - scroll, y, buf + a, buf + e, lg__col(LG_COL_TEXT));
