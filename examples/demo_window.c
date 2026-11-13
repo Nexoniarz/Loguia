@@ -12,9 +12,14 @@
 #include "../loguia.h"
 #include "demo_ui.h"
 
-int main(void) {
+/* demo_window [font [font behind it]]: for example a Chinese, Japanese or Korean font, and a Latin one */
+int main(int argc, char **argv) {
     demo_state st;
+    lg_font *font = 0, *back = 0;
     if (!lg_window_open("Loguia demo", 1100, 680)) { fprintf(stderr, "could not open a window\n"); return 1; }
+    if (argc > 1 && !(font = lg_font_load_file(argv[1], 16))) fprintf(stderr, "%s: not a font\n", argv[1]);
+    if (font && argc > 2 && (back = lg_font_load_file(argv[2], 16)) != 0) lg_font_fallback(font, back);
+    if (font) lg_set_font(font);
     demo_init(&st);
     while (lg_window_begin_frame()) {
         demo_ui(&st);
@@ -22,5 +27,7 @@ int main(void) {
         if (st.quit) break;                 /* File > Quit */
     }
     lg_window_close();
+    lg_font_free(font);
+    lg_font_free(back);
     return 0;
 }

@@ -36,6 +36,12 @@
        LOGUIA_WAYLAND   with LOGUIA_WINDOW on Linux and BSD: talk to Wayland directly, and use
                                     X11 only where that is not possible (LOGUIA_NO_X11 leaves X11 out)
 
+   FONTS AND LANGUAGES
+       The built-in font covers Latin scripts. lg_font_load() reads any TrueType or OpenType font
+       at any size, Chinese, Japanese and Korean ones too, and lg_font_fallback() chains them.
+       Input methods work in every text field (lg_input_compose, lg_ime_rect; the window module
+       connects them to the system).
+
    COMPILE-TIME SETTINGS (define before the implementation)
        LOGUIA_STATIC                 make every function static (private to one file)
        LOGUIA_MALLOC / LOGUIA_REALLOC / LOGUIA_FREE     your own allocator
@@ -54,7 +60,8 @@
 
    RUN-TIME SETTINGS
        lg_get_style() returns every colour and size; change any of them at any time.
-       lg_set_font() swaps the font. lg_set_clipboard() connects copy and paste.
+       lg_font_load() reads a TrueType or OpenType font at any size; lg_set_font() switches to it.
+       lg_set_clipboard() connects copy and paste.
 
    KEYBOARD
        Tab and Shift+Tab (or Up and Down) walk through the widgets, Enter or Space presses the
@@ -88,7 +95,7 @@ extern "C" {
 #endif
 #endif
 
-#define LOGUIA_VERSION "0.3.0"
+#define LOGUIA_VERSION "0.4.0"
 
 /* ---------------------------------------------------------------- style */
 
@@ -128,10 +135,10 @@ LGDEF unsigned int lg_rgba(int r, int g, int b, int a);
 /* One character in the font picture. x,y,w,h: where it is in the picture. xo,yo: where to
    put it relative to the pen (top of the line). adv: how far the pen moves afterwards. */
 typedef struct lg_glyph {
-    unsigned short cp, x, y;
-    unsigned char w, h;
-    signed char xo, yo;
-    unsigned char adv;
+    unsigned int cp;
+    unsigned short x, y, w, h;
+    short xo, yo;
+    unsigned short adv;
 } lg_glyph;
 
 /* pixels: one byte per pixel (0 = empty, 255 = solid). The 2x2 pixels at the top-left corner
@@ -145,7 +152,25 @@ typedef struct lg_font {
     float line_height;
     float scale;        /* how many times bigger than normal the picture is: 2 for a font made at
                            double size for HiDPI screens. 0 means 1. */
+    unsigned int version;   /* goes up whenever the picture changes: a renderer of your own uploads it again then */
+    void *source;           /* a font from lg_font_load: where its characters come from. NULL otherwise */
 } lg_font;
+
+/* A font from a TrueType or OpenType file (.ttf, .otf, or the first font in a .ttc), at a size of
+   `pixels`: any size, and it can be loaded again at another one while the program runs. Each
+   character is drawn into the font picture the first time it is shown, so a font with tens of
+   thousands of them (Chinese, Japanese, Korean) costs only what is on screen. HiDPI screens get
+   it drawn sharp at their own scale. The data has to stay alive as long as the font.
+   Returns NULL when the data is not a font. Use it with lg_set_font; lg_font_free when done. */
+LGDEF lg_font *lg_font_load(const void *data, int size, float pixels);
+#ifndef LOGUIA_NO_STDIO
+LGDEF lg_font *lg_font_load_file(const char *path, float pixels);
+#endif
+LGDEF void lg_font_free(lg_font *font);
+/* Characters that font does not have are taken from other (also from lg_font_load), at font's
+   size and on its line: a Chinese font with a Latin one behind it, for example. Several can be
+   chained. other has to stay alive as long as font is used; NULL takes the fallback away. */
+LGDEF void lg_font_fallback(lg_font *font, lg_font *other);
 
 LGDEF void lg_set_font(const lg_font *font);
 LGDEF const lg_font *lg_get_font(void);
@@ -181,6 +206,13 @@ LGDEF void lg_input_char(unsigned int codepoint);           /* typed text, as Un
 LGDEF void lg_set_clipboard(const char *(*get)(void *user), void (*set)(void *user, const char *text), void *user);
 LGDEF int lg_wants_mouse(void);      /* the mouse is over the interface: don't use the click yourself */
 LGDEF int lg_wants_keyboard(void);   /* a text field is being typed into, or a widget is marked */
+/* Input methods (Chinese, Japanese, Korean and others). While the user composes a word, its
+   text is shown at the caret: pass it here, with the caret as a byte offset into it, and NULL
+   or "" when the composing ends. The finished text arrives through lg_input_char as usual.
+   lg_ime_rect says where the caret of the field being typed into is, so the system can put its
+   list of candidates beside it: 0 when no field is being typed into. The window modules do both. */
+LGDEF void lg_input_compose(const char *text, int caret);
+LGDEF int lg_ime_rect(float *x, float *y, float *w, float *h);
 LGDEF void lg_set_keyboard_nav(int on);     /* Tab / arrows / Enter between widgets; on by default */
 
 /* ---------------------------------------------------------------- windows and panels */
@@ -1352,6 +1384,10 @@ typedef struct {
     unsigned int undo_id;
     double undo_time;
 
+    char compose[256];              /* what an input method is composing, and where its caret is */
+    int compose_caret, ime_frame;
+    lg__rect ime;                   /* the caret of the field being typed into */
+
     unsigned int num_id, num_wait;  /* the slider whose number is being typed; the one whose number was pressed */
     int num_frame;
     char num[32];
@@ -1491,6 +1527,7 @@ static unsigned char *lg__unpack_font(const char *const *rle, int total) {
 /* the built-in font: the normal one, or the double-size one for HiDPI screens */
 static void lg__default_font(int big) {
     lg__ctx *c = &lg__c;
+    c->font.source = 0;
 #ifdef LG__FONT2_GLYPHS
     if (big) {
         if (!c->own_pixels2) c->own_pixels2 = lg__unpack_font(lg__font2_rle, LG__ATLAS2_W * LG__ATLAS2_H);
@@ -1510,7 +1547,689 @@ static void lg__default_font(int big) {
 }
 #endif
 
-LGDEF void lg_set_font(const lg_font *font) { lg__c.font = *font; }
+/* ---------------------------------------------------------------- fonts from TrueType and OpenType files */
+
+/* a piece of the file, and a place in it; reading past its end gives zeros */
+typedef struct { const unsigned char *p; int n, at; } lg__rd;
+
+static lg__rd lg__rd_make(const unsigned char *p, int n) { lg__rd r; r.p = p; r.n = n < 0 ? 0 : n; r.at = 0; return r; }
+static int lg__rd8(lg__rd *r) { int v = r->at >= 0 && r->at < r->n ? r->p[r->at] : 0; r->at++; return v; }
+static unsigned int lg__rdn(lg__rd *r, int bytes) { unsigned int v = 0; while (bytes-- > 0) v = v << 8 | (unsigned int)lg__rd8(r); return v; }
+static lg__rd lg__rd_part(const lg__rd *r, int at, int n) {
+    if (at < 0 || n < 0 || at > r->n || n > r->n - at) return lg__rd_make(r->p, 0);
+    return lg__rd_make(r->p + at, n);
+}
+
+typedef struct lg__tt {
+    lg_font font;                   /* what lg_set_font copies */
+    const unsigned char *data;
+    int size;
+    void *own_data;                 /* the file, when lg_font_load_file read it */
+    unsigned int glyf, loca, hmtx, cmap;
+    int cmap_format, loca_long, glyphs_total, hmetrics, units, ascent, descent, gap;
+    int cff;                        /* 0: TrueType outlines, 1: CFF, 2: CFF2 */
+    lg__rd cfftab, gsubrs, charstrings, subrs, fdarray, fdselect, vstore;
+    float pixels, scale, k, top;    /* the size; the screen scale it is drawn for; font units to picture pixels; the baseline */
+    struct lg__tt *next;            /* where missing characters come from */
+    lg_glyph *glyphs;
+    int count, cap, pen_x, pen_y, row_h, full;
+    unsigned char *pixels_own;
+    float *acc;                     /* the rasteriser's work area */
+    int acc_cap;
+} lg__tt;
+
+static unsigned int lg__t16(const lg__tt *f, unsigned int at) { return at + 2 <= (unsigned int)f->size ? (unsigned int)(f->data[at] << 8 | f->data[at + 1]) : 0; }
+static unsigned int lg__t32(const lg__tt *f, unsigned int at) { return at + 4 <= (unsigned int)f->size ? lg__t16(f, at) << 16 | lg__t16(f, at + 2) : 0; }
+static int lg__ts16(const lg__tt *f, unsigned int at) { return (int)(short)lg__t16(f, at); }
+static unsigned int lg__tt_table(const lg__tt *f, unsigned int font, const char *tag, unsigned int *len) {
+    unsigned int count = lg__t16(f, font + 4), i;
+    for (i = 0; i < count; i++) {
+        unsigned int rec = font + 12 + 16 * i, at, n;
+        if (rec + 16 > (unsigned int)f->size) break;
+        if (memcmp(f->data + rec, tag, 4) != 0) continue;
+        at = lg__t32(f, rec + 8); n = lg__t32(f, rec + 12);
+        if (at > (unsigned int)f->size || n > (unsigned int)f->size - at) return 0;
+        if (len) *len = n;
+        return at;
+    }
+    return 0;
+}
+
+/* which of the font's glyphs draws the character cp; 0 for none */
+static int lg__tt_gid(const lg__tt *f, unsigned int cp) {
+    unsigned int t = f->cmap, i;
+    if (f->cmap_format == 12) {
+        unsigned int lo = 0, hi = lg__t32(f, t + 12);
+        while (lo < hi) {
+            unsigned int mid = (lo + hi) / 2, g = t + 16 + 12 * mid;
+            if (cp < lg__t32(f, g)) hi = mid;
+            else if (cp > lg__t32(f, g + 4)) lo = mid + 1;
+            else return (int)(lg__t32(f, g + 8) + cp - lg__t32(f, g));
+        }
+        return 0;
+    }
+    if (f->cmap_format == 4 && cp <= 0xFFFF) {
+        unsigned int segs = lg__t16(f, t + 6) / 2, ends = t + 14, starts = ends + 2 * segs + 2, deltas = starts + 2 * segs, ranges = deltas + 2 * segs;
+        for (i = 0; i < segs; i++) {
+            unsigned int start, delta, ro, g;
+            if (cp > lg__t16(f, ends + 2 * i)) continue;
+            start = lg__t16(f, starts + 2 * i);
+            if (cp < start) return 0;
+            delta = lg__t16(f, deltas + 2 * i); ro = lg__t16(f, ranges + 2 * i);
+            if (!ro) return (int)((cp + delta) & 0xFFFF);
+            g = lg__t16(f, ranges + 2 * i + ro + 2 * (cp - start));
+            return g ? (int)((g + delta) & 0xFFFF) : 0;
+        }
+    }
+    return 0;
+}
+
+/* An outline becomes straight edges in picture pixels (y going down); curves are cut into short pieces. */
+typedef struct { float *seg; int n, cap, open; float k, cx, cy, sx, sy; } lg__path;
+
+static void lg__path_seg(lg__path *p, float x0, float y0, float x1, float y1) {
+    if (p->n == p->cap) {
+        p->cap = p->cap * 2 + 64;
+        p->seg = (float *)LOGUIA_REALLOC(p->seg, (size_t)p->cap * 4 * sizeof(float));
+    }
+    p->seg[4 * p->n] = x0; p->seg[4 * p->n + 1] = y0; p->seg[4 * p->n + 2] = x1; p->seg[4 * p->n + 3] = y1;
+    p->n++;
+}
+static void lg__path_close(lg__path *p) {
+    if (p->open && (p->cx != p->sx || p->cy != p->sy)) lg__path_seg(p, p->cx, p->cy, p->sx, p->sy);
+    p->open = 0;
+}
+/* these take font units */
+static void lg__path_move(lg__path *p, float x, float y) { lg__path_close(p); p->cx = p->sx = x * p->k; p->cy = p->sy = -y * p->k; p->open = 1; }
+static void lg__path_line(lg__path *p, float x, float y) {
+    float X = x * p->k, Y = -y * p->k;
+    lg__path_seg(p, p->cx, p->cy, X, Y);
+    p->cx = X; p->cy = Y;
+}
+static int lg__path_steps(float d) { int n = (int)lg__sqrt(d * 2) + 1; return n < 1 ? 1 : n > 24 ? 24 : n; }
+static float lg__absf(float v) { return v < 0 ? -v : v; }
+static void lg__path_quad(lg__path *p, float qx, float qy, float x, float y) {
+    float x0 = p->cx, y0 = p->cy, x1 = qx * p->k, y1 = -qy * p->k, x2 = x * p->k, y2 = -y * p->k;
+    int n = lg__path_steps(lg__absf(x1 - x0) + lg__absf(y1 - y0) + lg__absf(x2 - x1) + lg__absf(y2 - y1)), i;
+    for (i = 1; i <= n; i++) {
+        float t = (float)i / (float)n, u = 1 - t;
+        float X = u * u * x0 + 2 * u * t * x1 + t * t * x2, Y = u * u * y0 + 2 * u * t * y1 + t * t * y2;
+        lg__path_seg(p, p->cx, p->cy, X, Y);
+        p->cx = X; p->cy = Y;
+    }
+}
+static void lg__path_cubic(lg__path *p, float ax, float ay, float bx, float by, float x, float y) {
+    float x0 = p->cx, y0 = p->cy, x1 = ax * p->k, y1 = -ay * p->k, x2 = bx * p->k, y2 = -by * p->k, x3 = x * p->k, y3 = -y * p->k;
+    int n = lg__path_steps(lg__absf(x1 - x0) + lg__absf(y1 - y0) + lg__absf(x2 - x1) + lg__absf(y2 - y1) + lg__absf(x3 - x2) + lg__absf(y3 - y2)), i;
+    for (i = 1; i <= n; i++) {
+        float t = (float)i / (float)n, u = 1 - t;
+        float X = u * u * u * x0 + 3 * u * u * t * x1 + 3 * u * t * t * x2 + t * t * t * x3;
+        float Y = u * u * u * y0 + 3 * u * u * t * y1 + 3 * u * t * t * y2 + t * t * t * y3;
+        lg__path_seg(p, p->cx, p->cy, X, Y);
+        p->cx = X; p->cy = Y;
+    }
+}
+
+/* --- TrueType outlines (the glyf table): straight lines and quadratic curves */
+static void lg__glyf_outline(const lg__tt *f, int gid, lg__path *p, const float *m, int depth) {
+    unsigned int a, b, g;
+    int contours;
+    if (gid < 0 || gid >= f->glyphs_total || depth > 8) return;
+    if (f->loca_long) { a = lg__t32(f, f->loca + 4 * (unsigned int)gid); b = lg__t32(f, f->loca + 4 * (unsigned int)gid + 4); }
+    else { a = 2 * lg__t16(f, f->loca + 2 * (unsigned int)gid); b = 2 * lg__t16(f, f->loca + 2 * (unsigned int)gid + 2); }
+    if (a >= b) return;                 /* an empty glyph: a space */
+    g = f->glyf + a;
+    contours = lg__ts16(f, g);
+    if (contours >= 0) {
+        unsigned int ends = g + 10, at;
+        int points = contours ? (int)lg__t16(f, ends + 2 * (unsigned int)(contours - 1)) + 1 : 0, i, c, s0 = 0;
+        unsigned char *fl;
+        float *xy;
+        int v = 0;
+        if (points <= 0 || points > 0xFFFF) return;
+        fl = (unsigned char *)LOGUIA_MALLOC((size_t)points);
+        xy = (float *)LOGUIA_MALLOC((size_t)points * 2 * sizeof(float));
+        at = ends + 2 * (unsigned int)contours;
+        at += 2 + lg__t16(f, at);       /* past the instructions */
+        for (i = 0; i < points;) {      /* flags, some of them repeated */
+            int flag = at < (unsigned int)f->size ? f->data[at++] : 0, rep = 0;
+            if (flag & 8) rep = at < (unsigned int)f->size ? f->data[at++] : 0;
+            for (; rep >= 0 && i < points; rep--) fl[i++] = (unsigned char)flag;
+        }
+        for (i = 0; i < points; i++) {  /* x, then y: each a change from the point before */
+            int flag = fl[i];
+            if (flag & 2) { int d = at < (unsigned int)f->size ? f->data[at] : 0; at++; v += flag & 16 ? d : -d; }
+            else if (!(flag & 16)) { v += lg__ts16(f, at); at += 2; }
+            xy[2 * i] = (float)v;
+        }
+        for (i = 0, v = 0; i < points; i++) {
+            int flag = fl[i];
+            if (flag & 4) { int d = at < (unsigned int)f->size ? f->data[at] : 0; at++; v += flag & 32 ? d : -d; }
+            else if (!(flag & 32)) { v += lg__ts16(f, at); at += 2; }
+            xy[2 * i + 1] = (float)v;
+        }
+        for (i = 0; i < points; i++) {  /* through the transform of a composite glyph */
+            float x = xy[2 * i], y = xy[2 * i + 1];
+            xy[2 * i] = m[0] * x + m[2] * y + m[4];
+            xy[2 * i + 1] = m[1] * x + m[3] * y + m[5];
+        }
+        for (c = 0; c < contours; c++) {
+            int e = (int)lg__t16(f, ends + 2 * (unsigned int)c), n = e - s0 + 1, first = -1, j, pend = 0;
+            float px = 0, py = 0, sx, sy;
+            if (n <= 0 || e >= points) break;
+            for (j = 0; j < n; j++) if (fl[s0 + j] & 1) { first = j; break; }
+            /* start on a point that is on the curve; when there is none, half-way between the last and the first */
+            if (first >= 0) { sx = xy[2 * (s0 + first)]; sy = xy[2 * (s0 + first) + 1]; }
+            else { sx = (xy[2 * s0] + xy[2 * e]) / 2; sy = (xy[2 * s0 + 1] + xy[2 * e + 1]) / 2; }
+            lg__path_move(p, sx, sy);
+            for (j = first >= 0 ? 1 : 0; j <= (first >= 0 ? n : n - 1); j++) {
+                int i2 = s0 + (first >= 0 ? (first + j) % n : j);
+                float x = xy[2 * i2], y = xy[2 * i2 + 1];
+                if (fl[i2] & 1) {
+                    if (pend) lg__path_quad(p, px, py, x, y); else lg__path_line(p, x, y);
+                    pend = 0;
+                } else {
+                    if (pend) lg__path_quad(p, px, py, (px + x) / 2, (py + y) / 2);     /* two off points: one on point is between them */
+                    px = x; py = y; pend = 1;
+                }
+            }
+            if (pend) lg__path_quad(p, px, py, sx, sy);
+            lg__path_close(p);
+            s0 = e + 1;
+        }
+        LOGUIA_FREE(fl); LOGUIA_FREE(xy);
+    } else {                            /* made of other glyphs, each moved, maybe turned or scaled */
+        unsigned int at = g + 10, flags;
+        do {
+            float t[4] = { 1, 0, 0, 1 }, dx, dy, mm[6];
+            int child;
+            flags = lg__t16(f, at); child = (int)lg__t16(f, at + 2); at += 4;
+            if (flags & 1) { dx = (float)lg__ts16(f, at); dy = (float)lg__ts16(f, at + 2); at += 4; }
+            else { dx = (float)(signed char)(at < (unsigned int)f->size ? f->data[at] : 0); dy = (float)(signed char)(at + 1 < (unsigned int)f->size ? f->data[at + 1] : 0); at += 2; }
+            if (!(flags & 2)) dx = dy = 0;      /* matched points: rare, left where they are */
+            if (flags & 8) { t[0] = t[3] = (float)lg__ts16(f, at) / 16384; at += 2; }
+            else if (flags & 0x40) { t[0] = (float)lg__ts16(f, at) / 16384; t[3] = (float)lg__ts16(f, at + 2) / 16384; at += 4; }
+            else if (flags & 0x80) { t[0] = (float)lg__ts16(f, at) / 16384; t[1] = (float)lg__ts16(f, at + 2) / 16384; t[2] = (float)lg__ts16(f, at + 4) / 16384; t[3] = (float)lg__ts16(f, at + 6) / 16384; at += 8; }
+            mm[0] = m[0] * t[0] + m[2] * t[1]; mm[1] = m[1] * t[0] + m[3] * t[1];
+            mm[2] = m[0] * t[2] + m[2] * t[3]; mm[3] = m[1] * t[2] + m[3] * t[3];
+            mm[4] = m[0] * dx + m[2] * dy + m[4]; mm[5] = m[1] * dx + m[3] * dy + m[5];
+            lg__glyf_outline(f, child, p, mm, depth + 1);
+        } while ((flags & 0x20) && at < (unsigned int)f->size);
+    }
+}
+
+/* --- CFF and CFF2 outlines (OpenType .otf): little programs that draw lines and cubic curves */
+static lg__rd lg__cff_index(lg__rd *r, int ver) {      /* an INDEX at r's place; r moves past it */
+    int start = r->at, count = (int)lg__rdn(r, ver == 2 ? 4 : 2), size, last;
+    if (count <= 0) return lg__rd_part(r, start, r->at - start);
+    size = lg__rd8(r);
+    if (size < 1 || size > 4) { r->at = r->n; return lg__rd_make(r->p, 0); }
+    r->at += size * count;
+    last = (int)lg__rdn(r, size);
+    r->at += last - 1;
+    return lg__rd_part(r, start, r->at - start);
+}
+static int lg__cff_count(lg__rd idx, int ver) { idx.at = 0; return (int)lg__rdn(&idx, ver == 2 ? 4 : 2); }
+static lg__rd lg__cff_get(lg__rd idx, int ver, int i) {
+    int cs = ver == 2 ? 4 : 2, count, size, a, b;
+    idx.at = 0;
+    count = (int)lg__rdn(&idx, cs); size = lg__rd8(&idx);
+    if (i < 0 || i >= count || size < 1 || size > 4) return lg__rd_make(idx.p, 0);
+    idx.at = cs + 1 + i * size;
+    a = (int)lg__rdn(&idx, size); b = (int)lg__rdn(&idx, size);
+    return lg__rd_part(&idx, cs + (count + 1) * size + a, b - a);
+}
+static lg__rd lg__cff_index_at(lg__rd table, int at, int ver) {
+    lg__rd r = table;
+    if (at <= 0 || at >= table.n) return lg__rd_make(table.p, 0);
+    r.at = at;
+    return lg__cff_index(&r, ver);
+}
+/* the numbers in front of the key in a DICT; returns how many there were */
+static int lg__dict(lg__rd d, int key, int max, int *out) {
+    d.at = 0;
+    while (d.at < d.n) {
+        int n = 0, op;
+        while (d.at < d.n && d.p[d.at] >= 28 && d.p[d.at] != 31 && d.p[d.at] != 255) {
+            int b0 = lg__rd8(&d), v = 0;
+            if (b0 == 30) {             /* a real number: skipped, Loguia needs none */
+                while (d.at < d.n) { int b = lg__rd8(&d); if ((b & 15) == 15 || (b >> 4) == 15) break; }
+            } else if (b0 == 28) v = (int)(short)lg__rdn(&d, 2);
+            else if (b0 == 29) v = (int)lg__rdn(&d, 4);
+            else if (b0 < 247) v = b0 - 139;
+            else if (b0 < 251) v = (b0 - 247) * 256 + lg__rd8(&d) + 108;
+            else v = -(b0 - 251) * 256 - lg__rd8(&d) - 108;
+            if (n < max) out[n] = v;
+            n++;
+        }
+        if (d.at >= d.n) break;
+        op = lg__rd8(&d);
+        if (op == 12) op = 0x100 | lg__rd8(&d);
+        if (op == key) return n;
+    }
+    return 0;
+}
+static int lg__cff_bias(int count) { return count < 1240 ? 107 : count < 33900 ? 1131 : 32768; }
+/* how many numbers each blended value carries in a CFF2 font, for the variation data number vs */
+static int lg__cff_regions(const lg__tt *f, int vs) {
+    lg__rd v = f->vstore;
+    int count, at;
+    v.at = 2 + 6;                       /* the length, the format and the region list come first */
+    count = (int)lg__rdn(&v, 2);
+    if (vs < 0 || vs >= count) return 0;
+    v.at = 2 + 8 + 4 * vs;
+    at = (int)lg__rdn(&v, 4);
+    v.at = 2 + at + 4;
+    return (int)lg__rdn(&v, 2);
+}
+/* a CID-keyed or CFF2 font keeps its subroutines per group of glyphs: the group of glyph gid */
+static int lg__cff_fd(const lg__tt *f, int gid) {
+    lg__rd r = f->fdselect;
+    int format, n, i;
+    if (!r.n) return 0;
+    format = lg__rd8(&r);
+    if (format == 0) { r.at = 1 + gid; return lg__rd8(&r); }
+    if (format == 3 || format == 4) {
+        int w = format == 3 ? 2 : 4, first, fd, next;
+        n = (int)lg__rdn(&r, w);
+        first = (int)lg__rdn(&r, w);
+        for (i = 0; i < n; i++) {
+            fd = (int)lg__rdn(&r, format == 3 ? 1 : 2);
+            next = (int)lg__rdn(&r, w);
+            if (gid >= first && gid < next) return fd;
+            first = next;
+        }
+    }
+    return 0;
+}
+static void lg__cff_curve(lg__path *p, float *x, float *y, float d1, float d2, float d3, float d4, float d5, float d6) {
+    float ax = *x + d1, ay = *y + d2, bx = ax + d3, by = ay + d4;
+    *x = bx + d5; *y = by + d6;
+    lg__path_cubic(p, ax, ay, bx, by, *x, *y);
+}
+static void lg__cff_line(lg__path *p, float *x, float *y, float dx, float dy) { *x += dx; *y += dy; lg__path_line(p, *x, *y); }
+
+static int lg__cff_outline(const lg__tt *f, int gid, lg__path *p) {
+    lg__rd b = lg__cff_get(f->charstrings, f->cff, gid), subrs = f->subrs, stack[10];
+    float s[513], x = 0, y = 0;
+    int sp = 0, depth = 0, header = 1, maskbits = 0, vs = 0, i, clear;
+    if (f->fdarray.n) {                 /* the subroutines of this glyph's group */
+        lg__rd fd = lg__cff_get(f->fdarray, f->cff, lg__cff_fd(f, gid));
+        int pv[2] = { 0, 0 }, so = 0, vv = 0;
+        if (lg__dict(fd, 18, 2, pv) >= 2) {
+            lg__rd priv = lg__rd_part(&f->cfftab, pv[1], pv[0]);
+            if (lg__dict(priv, 19, 1, &so) >= 1) subrs = lg__cff_index_at(f->cfftab, pv[1] + so, f->cff);
+            else subrs = lg__rd_make(priv.p, 0);
+            if (lg__dict(priv, 22, 1, &vv) >= 1) vs = vv;
+        }
+    }
+    if (!b.n) return 0;
+    for (;;) {
+        int b0;
+        if (b.at >= b.n) {              /* the end of a subroutine (CFF2 has no return) or of the glyph */
+            if (depth > 0) { b = stack[--depth]; continue; }
+            break;
+        }
+        b0 = lg__rd8(&b);
+        i = 0; clear = 1;
+        switch (b0) {
+        case 19: case 20:               /* hintmask, cntrmask: hints, skipped */
+            if (header) maskbits += sp / 2;
+            header = 0;
+            b.at += (maskbits + 7) / 8;
+            break;
+        case 1: case 3: case 18: case 23: maskbits += sp / 2; break;       /* stems: only counted */
+        case 21: if (sp < 2) return 0; header = 0; lg__path_close(p); x += s[sp - 2]; y += s[sp - 1]; lg__path_move(p, x, y); break;
+        case 4: if (sp < 1) return 0; header = 0; lg__path_close(p); y += s[sp - 1]; lg__path_move(p, x, y); break;
+        case 22: if (sp < 1) return 0; header = 0; lg__path_close(p); x += s[sp - 1]; lg__path_move(p, x, y); break;
+        case 5: for (; i + 1 < sp; i += 2) lg__cff_line(p, &x, &y, s[i], s[i + 1]); break;
+        case 6: case 7: {               /* hlineto, vlineto: the lines take turns */
+            int h = b0 == 6;
+            for (; i < sp; i++, h = !h) lg__cff_line(p, &x, &y, h ? s[i] : 0, h ? 0 : s[i]);
+            break;
+        }
+        case 30: case 31: {             /* vhcurveto, hvcurveto */
+            int h = b0 == 31;
+            for (; i + 3 < sp; i += 4, h = !h) {
+                float last = sp - i == 5 ? s[i + 4] : 0;
+                if (h) lg__cff_curve(p, &x, &y, s[i], 0, s[i + 1], s[i + 2], last, s[i + 3]);
+                else lg__cff_curve(p, &x, &y, 0, s[i], s[i + 1], s[i + 2], s[i + 3], last);
+            }
+            break;
+        }
+        case 8: for (; i + 5 < sp; i += 6) lg__cff_curve(p, &x, &y, s[i], s[i + 1], s[i + 2], s[i + 3], s[i + 4], s[i + 5]); break;
+        case 24:                        /* rcurveline */
+            for (; i + 5 < sp - 2; i += 6) lg__cff_curve(p, &x, &y, s[i], s[i + 1], s[i + 2], s[i + 3], s[i + 4], s[i + 5]);
+            if (i + 1 < sp) lg__cff_line(p, &x, &y, s[i], s[i + 1]);
+            break;
+        case 25:                        /* rlinecurve */
+            for (; i + 1 < sp - 6; i += 2) lg__cff_line(p, &x, &y, s[i], s[i + 1]);
+            if (i + 5 < sp) lg__cff_curve(p, &x, &y, s[i], s[i + 1], s[i + 2], s[i + 3], s[i + 4], s[i + 5]);
+            break;
+        case 26: case 27: {             /* vvcurveto, hhcurveto */
+            float first = 0;
+            if (sp & 1) first = s[i++];
+            for (; i + 3 < sp; i += 4, first = 0) {
+                if (b0 == 27) lg__cff_curve(p, &x, &y, s[i], first, s[i + 1], s[i + 2], s[i + 3], 0);
+                else lg__cff_curve(p, &x, &y, first, s[i], s[i + 1], s[i + 2], 0, s[i + 3]);
+            }
+            break;
+        }
+        case 10: case 29: {             /* callsubr, callgsubr */
+            lg__rd list = b0 == 10 ? subrs : f->gsubrs;
+            int v;
+            if (sp < 1 || depth >= 10) return 0;
+            v = (int)s[--sp] + lg__cff_bias(lg__cff_count(list, f->cff));
+            stack[depth++] = b;
+            b = lg__cff_get(list, f->cff, v);
+            if (!b.n) return 0;
+            clear = 0;
+            break;
+        }
+        case 11: if (depth <= 0) return 0; b = stack[--depth]; clear = 0; break;    /* return */
+        case 14: lg__path_close(p); return 1;                                       /* endchar */
+        case 15: if (sp >= 1) vs = (int)s[sp - 1]; break;                          /* vsindex (CFF2) */
+        case 16: {                      /* blend (CFF2): the default values stay, the changes for other weights go */
+            int n, k = lg__cff_regions(f, vs), base;
+            if (sp < 1) return 0;
+            n = (int)s[sp - 1];
+            base = sp - 1 - n * (k + 1);
+            if (n < 0 || base < 0) return 0;
+            sp = base + n;
+            clear = 0;
+            break;
+        }
+        case 12: {                      /* the flex curves */
+            int b1 = lg__rd8(&b);
+            float dx, dy, d6;
+            if (b1 == 35 && sp >= 13) {
+                lg__cff_curve(p, &x, &y, s[0], s[1], s[2], s[3], s[4], s[5]);
+                lg__cff_curve(p, &x, &y, s[6], s[7], s[8], s[9], s[10], s[11]);
+            } else if (b1 == 34 && sp >= 7) {
+                lg__cff_curve(p, &x, &y, s[0], 0, s[1], s[2], s[3], 0);
+                lg__cff_curve(p, &x, &y, s[4], 0, s[5], -s[2], s[6], 0);
+            } else if (b1 == 36 && sp >= 9) {
+                lg__cff_curve(p, &x, &y, s[0], s[1], s[2], s[3], s[4], 0);
+                lg__cff_curve(p, &x, &y, s[5], 0, s[6], s[7], s[8], -(s[1] + s[3] + s[7]));
+            } else if (b1 == 37 && sp >= 11) {
+                dx = s[0] + s[2] + s[4] + s[6] + s[8]; dy = s[1] + s[3] + s[5] + s[7] + s[9]; d6 = s[10];
+                lg__cff_curve(p, &x, &y, s[0], s[1], s[2], s[3], s[4], s[5]);
+                if (lg__absf(dx) > lg__absf(dy)) lg__cff_curve(p, &x, &y, s[6], s[7], s[8], s[9], d6, -dy);
+                else lg__cff_curve(p, &x, &y, s[6], s[7], s[8], s[9], -dx, d6);
+            } else return 0;
+            break;
+        }
+        default: {                      /* a number */
+            float v;
+            if (b0 == 28) v = (float)(short)lg__rdn(&b, 2);
+            else if (b0 == 255) v = (float)(int)lg__rdn(&b, 4) / 65536.0f;
+            else if (b0 >= 32 && b0 <= 246) v = (float)(b0 - 139);
+            else if (b0 >= 247 && b0 <= 250) v = (float)((b0 - 247) * 256 + lg__rd8(&b) + 108);
+            else if (b0 >= 251 && b0 <= 254) v = (float)(-(b0 - 251) * 256 - lg__rd8(&b) - 108);
+            else return 0;
+            if (sp >= 513) return 0;
+            s[sp++] = v;
+            clear = 0;
+        }
+        }
+        if (clear) sp = 0;
+    }
+    lg__path_close(p);
+    return 1;
+}
+
+/* --- the rasteriser: how much of every pixel the edges cover, added up along each row */
+static void lg__raster_line(float *a, int stride, int h, float x0, float y0, float x1, float y1) {
+    float dir = 1, dxdy, x, lim = (float)(stride - 2);
+    int y, yend;
+    if (y0 == y1) return;
+    if (y0 > y1) { float t = x0; x0 = x1; x1 = t; t = y0; y0 = y1; y1 = t; dir = -1; }
+    dxdy = (x1 - x0) / (y1 - y0);
+    x = x0;
+    if (y0 < 0) { x -= y0 * dxdy; y0 = 0; }
+    yend = (int)-lg__floor(-y1);
+    if (yend > h) yend = h;
+    for (y = (int)lg__floor(y0); y < yend; y++) {
+        float *row = a + y * stride;
+        float dy = lg__min((float)(y + 1), y1) - lg__max((float)y, y0), xn = x + dxdy * dy, d = dy * dir;
+        float xa = lg__clamp(lg__min(x, xn), 0, lim), xb = lg__clamp(lg__max(x, xn), 0, lim), xaf = lg__floor(xa), xbc = -lg__floor(-xb);
+        int xai = (int)xaf, xbi = (int)xbc;
+        if (xbi <= xai + 1) {
+            float mid = 0.5f * (xa + xb) - xaf;
+            row[xai] += d - d * mid;
+            row[xai + 1] += d * mid;
+        } else {
+            float sl = 1 / (xb - xa), f0 = xa - xaf, a0 = 0.5f * sl * (1 - f0) * (1 - f0), f1 = xb - xbc + 1, am = 0.5f * sl * f1 * f1;
+            row[xai] += d * a0;
+            if (xbi == xai + 2) row[xai + 1] += d * (1 - a0 - am);
+            else {
+                float a1 = sl * (1.5f - f0);
+                int xi;
+                row[xai + 1] += d * (a1 - a0);
+                for (xi = xai + 2; xi < xbi - 1; xi++) row[xi] += d * sl;
+                row[xbi - 1] += d * (1 - (a1 + (float)(xbi - xai - 3) * sl) - am);
+            }
+            row[xbi] += d * am;
+        }
+        x = xn;
+    }
+}
+
+static void lg__tt_sync(lg__tt *f) {
+    f->font.pixels = f->pixels_own; f->font.glyphs = f->glyphs; f->font.glyph_count = f->count;
+    f->font.version++;
+    if (lg__c.font.source == f) lg__c.font = f->font;
+}
+/* starts the picture again: for another screen scale, or when it is full */
+static void lg__tt_reset(lg__tt *f, float scale) {
+    float lh;
+    if (scale <= 0) scale = 1;
+    f->scale = scale;
+    f->k = f->pixels * scale / (float)f->units;
+    lh = (float)(f->ascent - f->descent + f->gap) * f->k;
+    f->font.line_height = lg__floor(lh + 0.5f);
+    f->top = lg__floor((float)f->ascent * f->k + (float)f->gap * f->k / 2 + 0.5f);
+    f->font.scale = scale;
+    if (!f->pixels_own) {
+        f->font.width = f->pixels * scale > 40 ? 1024 : 512;
+        f->font.height = 256;
+        f->pixels_own = (unsigned char *)LOGUIA_MALLOC((size_t)f->font.width * (size_t)f->font.height);
+    }
+    memset(f->pixels_own, 0, (size_t)f->font.width * (size_t)f->font.height);
+    f->pixels_own[0] = f->pixels_own[1] = f->pixels_own[f->font.width] = f->pixels_own[f->font.width + 1] = 255;    /* the solid corner */
+    f->count = 0; f->full = 0;
+    f->pen_x = 4; f->pen_y = 0; f->row_h = 4;
+    lg__tt_sync(f);
+}
+/* a taller picture. What this frame has drawn already points into the picture by fractions of
+   its height: those are corrected, so nothing moves. */
+static int lg__tt_grow(lg__tt *f) {
+    lg__ctx *c = &lg__c;
+    int old = f->font.height, i;
+    unsigned int k;
+    if (old >= 4096) return 0;
+    f->pixels_own = (unsigned char *)LOGUIA_REALLOC(f->pixels_own, (size_t)f->font.width * (size_t)old * 2);
+    memset(f->pixels_own + (size_t)f->font.width * (size_t)old, 0, (size_t)f->font.width * (size_t)old);
+    f->font.height = old * 2;
+    if (c->font.source == f)
+        for (i = 0; i < c->ncmd; i++) {
+            unsigned int lo = 0xFFFFFFFFu, hi = 0;
+            if (c->cmds[i].texture) continue;
+            for (k = 0; k < c->cmds[i].index_count; k++) {
+                unsigned int v = c->idx[c->cmds[i].first_index + k];
+                if (v < lo) lo = v;
+                if (v > hi) hi = v;
+            }
+            for (k = lo; k <= hi && lo <= hi; k++) c->v[k].v *= 0.5f;
+        }
+    return 1;
+}
+static const lg_glyph *lg__tt_add(lg__tt *f, unsigned int cp) {
+    lg__path p;
+    lg_glyph g;
+    float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f;
+    const lg__tt *src = f;
+    int gid = 0, i, w = 0, h = 0, lo = 0, hi = f->count, guard = 0;
+    for (; src && guard < 16; src = src->next, guard++) if ((gid = lg__tt_gid(src, cp)) != 0) break;      /* this font, or the ones behind it */
+    if (!gid || !src || f->full) return 0;
+    memset(&p, 0, sizeof p);
+    memset(&g, 0, sizeof g);
+    p.k = f->pixels * f->scale / (float)src->units;
+    if (src->cff) lg__cff_outline(src, gid, &p);
+    else { static const float id[6] = { 1, 0, 0, 1, 0, 0 }; lg__glyf_outline(src, gid, &p, id, 0); }
+    for (i = 0; i < p.n; i++) {
+        x0 = lg__min(x0, lg__min(p.seg[4 * i], p.seg[4 * i + 2])); x1 = lg__max(x1, lg__max(p.seg[4 * i], p.seg[4 * i + 2]));
+        y0 = lg__min(y0, lg__min(p.seg[4 * i + 1], p.seg[4 * i + 3])); y1 = lg__max(y1, lg__max(p.seg[4 * i + 1], p.seg[4 * i + 3]));
+    }
+    g.cp = cp;
+    g.adv = (unsigned short)lg__floor((float)lg__t16(src, src->hmtx + 4 * (unsigned int)(gid < src->hmetrics ? gid : src->hmetrics - 1)) * p.k + 0.5f);
+    if (p.n) {
+        x0 = lg__floor(x0); y0 = lg__floor(y0);
+        w = (int)-lg__floor(-x1) - (int)x0; h = (int)-lg__floor(-y1) - (int)y0;
+        if (w > 1000 || h > 1000) w = h = 0;
+    }
+    if (w > 0 && h > 0) {
+        int stride = w + 2, y, x;
+        float *a;
+        if (f->pen_x + w + 2 > f->font.width) { f->pen_x = 0; f->pen_y += f->row_h; f->row_h = 0; }    /* a new shelf */
+        while (f->pen_y + h + 2 > f->font.height)
+            if (!lg__tt_grow(f)) { f->full = 1; LOGUIA_FREE(p.seg); return 0; }      /* starts again next frame */
+        if (stride * h > f->acc_cap) { f->acc_cap = stride * h; f->acc = (float *)LOGUIA_REALLOC(f->acc, (size_t)f->acc_cap * sizeof(float)); }
+        a = f->acc;
+        memset(a, 0, (size_t)(stride * h) * sizeof(float));
+        for (i = 0; i < p.n; i++)
+            lg__raster_line(a, stride, h, p.seg[4 * i] - x0, p.seg[4 * i + 1] - y0, p.seg[4 * i + 2] - x0, p.seg[4 * i + 3] - y0);
+        for (y = 0; y < h; y++) {
+            float sum = 0;
+            unsigned char *out = f->pixels_own + (size_t)(f->pen_y + 1 + y) * (size_t)f->font.width + (size_t)(f->pen_x + 1);
+            for (x = 0; x < w; x++) {
+                float v;
+                sum += a[y * stride + x];
+                v = lg__absf(sum);
+                out[x] = (unsigned char)(v >= 1 ? 255 : v * 255 + 0.5f);
+            }
+        }
+        g.x = (unsigned short)(f->pen_x + 1); g.y = (unsigned short)(f->pen_y + 1);
+        g.w = (unsigned short)w; g.h = (unsigned short)h;
+        g.xo = (short)x0; g.yo = (short)(y0 + f->top);
+        f->pen_x += w + 2;
+        if (h + 2 > f->row_h) f->row_h = h + 2;
+    }
+    LOGUIA_FREE(p.seg);
+    while (lo < hi) { int mid = (lo + hi) / 2; if (f->glyphs[mid].cp < cp) lo = mid + 1; else hi = mid; }     /* the list stays sorted */
+    if (f->count == f->cap) { f->cap = f->cap * 2 + 128; f->glyphs = (lg_glyph *)LOGUIA_REALLOC(f->glyphs, (size_t)f->cap * sizeof *f->glyphs); }
+    memmove(f->glyphs + lo + 1, f->glyphs + lo, (size_t)(f->count - lo) * sizeof *f->glyphs);
+    f->glyphs[lo] = g;
+    f->count++;
+    lg__tt_sync(f);
+    return &f->glyphs[lo];
+}
+
+LGDEF lg_font *lg_font_load(const void *data, int size, float pixels) {
+    const unsigned char *d = (const unsigned char *)data;
+    unsigned int font = 0, head, hhea, maxp, cmap, n, i, len, best = 0, cff, len2;
+    int best_rank = 0;
+    lg__tt *f;
+    if (!d || size < 12 || !(pixels > 0)) return 0;
+    f = (lg__tt *)LOGUIA_MALLOC(sizeof *f);
+    memset(f, 0, sizeof *f);
+    f->data = d; f->size = size;
+    if (memcmp(d, "ttcf", 4) == 0) font = lg__t32(f, 12);       /* a collection: its first font */
+    head = lg__tt_table(f, font, "head", 0); hhea = lg__tt_table(f, font, "hhea", 0);
+    maxp = lg__tt_table(f, font, "maxp", 0); cmap = lg__tt_table(f, font, "cmap", 0);
+    f->hmtx = lg__tt_table(f, font, "hmtx", 0);
+    f->units = (int)lg__t16(f, head + 18); f->loca_long = lg__ts16(f, head + 50) != 0;
+    f->glyphs_total = (int)lg__t16(f, maxp + 4); f->hmetrics = (int)lg__t16(f, hhea + 34);
+    f->ascent = lg__ts16(f, hhea + 4); f->descent = lg__ts16(f, hhea + 6); f->gap = lg__ts16(f, hhea + 8);
+    n = lg__t16(f, cmap + 2);
+    for (i = 0; i < n; i++) {           /* the best map from characters to glyphs: all of Unicode first */
+        unsigned int pl = lg__t16(f, cmap + 4 + 8 * i), enc = lg__t16(f, cmap + 6 + 8 * i), at = cmap + lg__t32(f, cmap + 8 + 8 * i);
+        int format = (int)lg__t16(f, at), rank = 0;
+        if (format == 12 && (pl == 0 || (pl == 3 && enc == 10))) rank = 2;
+        else if (format == 4 && (pl == 0 || (pl == 3 && (enc == 1 || enc == 0)))) rank = 1;
+        if (rank > best_rank) { best_rank = rank; best = at; f->cmap_format = format; }
+    }
+    f->cmap = best;
+    f->glyf = lg__tt_table(f, font, "glyf", 0); f->loca = lg__tt_table(f, font, "loca", 0);
+    if ((cff = lg__tt_table(f, font, "CFF ", &len)) != 0) {
+        lg__rd r = lg__rd_make(d + cff, (int)len), top;
+        int v[2] = { 0, 0 };
+        f->cff = 1;
+        f->cfftab = r;
+        r.at = r.n > 2 ? r.p[2] : 0;
+        lg__cff_index(&r, 1);                                   /* the names */
+        top = lg__cff_get(lg__cff_index(&r, 1), 1, 0);          /* the top DICT */
+        lg__cff_index(&r, 1);                                   /* the strings */
+        f->gsubrs = lg__cff_index(&r, 1);
+        if (lg__dict(top, 17, 1, v)) f->charstrings = lg__cff_index_at(f->cfftab, v[0], 1);
+        if (lg__dict(top, 0x124, 1, v)) f->fdarray = lg__cff_index_at(f->cfftab, v[0], 1);
+        if (lg__dict(top, 0x125, 1, v)) f->fdselect = lg__rd_part(&f->cfftab, v[0], f->cfftab.n - v[0]);
+        if (lg__dict(top, 18, 2, v) >= 2) {
+            lg__rd priv = lg__rd_part(&f->cfftab, v[1], v[0]);
+            int so = 0;
+            if (lg__dict(priv, 19, 1, &so)) f->subrs = lg__cff_index_at(f->cfftab, v[1] + so, 1);
+        }
+    } else if ((cff = lg__tt_table(f, font, "CFF2", &len2)) != 0) {
+        lg__rd r = lg__rd_make(d + cff, (int)len2), top;
+        int v[2] = { 0, 0 }, hdr = r.n > 4 ? r.p[2] : 0, tl = r.n > 4 ? r.p[3] << 8 | r.p[4] : 0;
+        f->cff = 2;
+        f->cfftab = r;
+        top = lg__rd_part(&r, hdr, tl);
+        r.at = hdr + tl;
+        f->gsubrs = lg__cff_index(&r, 2);
+        if (lg__dict(top, 17, 1, v)) f->charstrings = lg__cff_index_at(f->cfftab, v[0], 2);
+        if (lg__dict(top, 0x124, 1, v)) f->fdarray = lg__cff_index_at(f->cfftab, v[0], 2);
+        if (lg__dict(top, 0x125, 1, v)) f->fdselect = lg__rd_part(&f->cfftab, v[0], f->cfftab.n - v[0]);
+        if (lg__dict(top, 24, 1, v)) f->vstore = lg__rd_part(&f->cfftab, v[0], f->cfftab.n - v[0]);
+    }
+    if (!head || !hhea || !f->hmtx || !f->cmap || f->units <= 0 || f->hmetrics <= 0 ||
+        (f->cff ? !f->charstrings.n : (!f->glyf || !f->loca))) { LOGUIA_FREE(f); return 0; }
+    f->pixels = lg__clamp(pixels, 4, 256);
+    f->font.source = f;
+    lg__tt_reset(f, lg__c.pixel_scale > 0 ? lg__c.pixel_scale : 1);
+    return &f->font;
+}
+#ifndef LOGUIA_NO_STDIO
+LGDEF lg_font *lg_font_load_file(const char *path, float pixels) {
+    FILE *fp = fopen(path, "rb");
+    long n;
+    unsigned char *d;
+    lg_font *font = 0;
+    if (!fp) return 0;
+    fseek(fp, 0, SEEK_END); n = ftell(fp); fseek(fp, 0, SEEK_SET);
+    d = n > 0 && n < 0x7FFFFFFF ? (unsigned char *)LOGUIA_MALLOC((size_t)n) : 0;
+    if (d && fread(d, 1, (size_t)n, fp) == (size_t)n) font = lg_font_load(d, (int)n, pixels);
+    fclose(fp);
+    if (font) ((lg__tt *)font->source)->own_data = d;
+    else LOGUIA_FREE(d);
+    return font;
+}
+#endif
+LGDEF void lg_font_fallback(lg_font *font, lg_font *other) {
+    lg__tt *f = font ? (lg__tt *)font->source : 0;
+    if (!f || (other && other->source == f)) return;
+    f->next = other ? (lg__tt *)other->source : 0;
+    lg__tt_reset(f, f->scale);          /* characters drawn before may come out differently now */
+}
+LGDEF void lg_font_free(lg_font *font) {
+    lg__tt *f = font ? (lg__tt *)font->source : 0;
+    if (!f) return;
+    if (lg__c.font.source == f) {       /* it was in use: back to the built-in one */
+#ifndef LOGUIA_NO_DEFAULT_FONT
+        lg__default_font(lg__c.pixel_scale >= 1.25f);
+#else
+        memset(&lg__c.font, 0, sizeof lg__c.font);
+#endif
+    }
+    LOGUIA_FREE(f->pixels_own); LOGUIA_FREE(f->glyphs); LOGUIA_FREE(f->acc); LOGUIA_FREE(f->own_data);
+    LOGUIA_FREE(f);
+}
+
+LGDEF void lg_set_font(const lg_font *font) {
+    lg__c.font = *font;
+    if (font->source && ((lg__tt *)font->source)->scale != (lg__c.pixel_scale > 0 ? lg__c.pixel_scale : 1))
+        lg__tt_reset((lg__tt *)font->source, lg__c.pixel_scale);
+}
 LGDEF const lg_font *lg_get_font(void) { return &lg__c.font; }
 LGDEF void lg_set_pixel_scale(float scale) {
     lg__ctx *c = &lg__c;
@@ -1519,6 +2238,7 @@ LGDEF void lg_set_pixel_scale(float scale) {
     if (c->font.pixels && (c->font.pixels == c->own_pixels || c->font.pixels == c->own_pixels2))
         lg__default_font(c->pixel_scale >= 1.25f);
 #endif
+    if (c->font.source && ((lg__tt *)c->font.source)->scale != c->pixel_scale) lg__tt_reset((lg__tt *)c->font.source, c->pixel_scale);
 }
 /* font picture pixels to interface units */
 static float lg__fs(void) { return lg__c.style.font_scale / (lg__c.font.scale > 0 ? lg__c.font.scale : 1); }
@@ -1531,7 +2251,7 @@ static const lg_glyph *lg__find_glyph(unsigned int cp) {
         if (m == cp) return &lg__c.font.glyphs[mid];
         if (m < cp) lo = mid + 1; else hi = mid - 1;
     }
-    return 0;
+    return lg__c.font.source ? lg__tt_add((lg__tt *)lg__c.font.source, cp) : 0;     /* a loaded font draws it now */
 }
 static const lg_glyph *lg__glyph(unsigned int cp) {
     const lg_glyph *g = lg__find_glyph(cp == '\t' ? ' ' : cp);
@@ -1552,6 +2272,16 @@ static const char *lg__utf8(const char *s, const char *end, unsigned int *cp) {
     }
     *cp = c;
     return s;
+}
+
+/* writes one character as UTF-8, returns how many bytes */
+static int lg__utf8_put(unsigned int cp, char *u) {
+    int n = 0;
+    if (cp < 0x80) u[n++] = (char)cp;
+    else if (cp < 0x800) { u[n++] = (char)(0xC0 | (cp >> 6)); u[n++] = (char)(0x80 | (cp & 0x3F)); }
+    else if (cp < 0x10000) { u[n++] = (char)(0xE0 | (cp >> 12)); u[n++] = (char)(0x80 | ((cp >> 6) & 0x3F)); u[n++] = (char)(0x80 | (cp & 0x3F)); }
+    else { u[n++] = (char)(0xF0 | (cp >> 18)); u[n++] = (char)(0x80 | ((cp >> 12) & 0x3F)); u[n++] = (char)(0x80 | ((cp >> 6) & 0x3F)); u[n++] = (char)(0x80 | (cp & 0x3F)); }
+    return n;
 }
 
 static float lg__text_w(const char *s, const char *end) {
@@ -2146,6 +2876,24 @@ LGDEF void lg_input_key(int key, int down) {
 LGDEF void lg_input_char(unsigned int cp) {
     if (cp >= 32 && cp != 127 && lg__c.nchars < 32) lg__c.chars[lg__c.nchars++] = cp;
 }
+LGDEF void lg_input_compose(const char *text, int caret) {
+    lg__ctx *c = &lg__c;
+    int n = text ? (int)strlen(text) : 0;
+    if (n > (int)sizeof c->compose - 1) n = (int)sizeof c->compose - 1;
+    while (n > 0 && ((unsigned char)text[n] & 0xC0) == 0x80) n--;        /* whole characters only */
+    if (n) memcpy(c->compose, text, (size_t)n);
+    c->compose[n] = 0;
+    c->compose_caret = caret < 0 || caret > n ? n : caret;
+}
+LGDEF int lg_ime_rect(float *x, float *y, float *w, float *h) {
+    lg__ctx *c = &lg__c;
+    int on = c->focus && c->ime_frame >= c->frame - 1 && c->ime_frame > 0;
+    if (x) *x = on ? c->ime.x : 0;
+    if (y) *y = on ? c->ime.y : 0;
+    if (w) *w = on ? c->ime.w : 0;
+    if (h) *h = on ? c->ime.h : 0;
+    return on;
+}
 LGDEF void lg_set_clipboard(const char *(*get)(void *), void (*set)(void *, const char *), void *user) {
     lg__c.clip_get = get; lg__c.clip_set = set; lg__c.clip_user = user;
 }
@@ -2164,6 +2912,7 @@ LGDEF void lg_begin_frame(float width, float height, float dt) {
     c->w = width; c->h = height; c->dt = dt; c->time += dt;
     c->frame++;
     c->nv = c->ni = c->ncmd = c->nclips = c->nids = 0;
+    if (c->font.source && ((lg__tt *)c->font.source)->full) lg__tt_reset((lg__tt *)c->font.source, c->pixel_scale);
     c->box = c->win = c->scroll_box = 0;
     c->layer = 0;
     c->next_w = 0;
@@ -3473,13 +4222,7 @@ static int lg__edit(unsigned int id, const char *label, char *buf, int cap, int 
         }
         for (i = 0; i < c->nchars && !fixed; i++) {
             char u[4];
-            unsigned int cp = c->chars[i];
-            int n = 0;
-            if (cp < 0x80) u[n++] = (char)cp;
-            else if (cp < 0x800) { u[n++] = (char)(0xC0 | (cp >> 6)); u[n++] = (char)(0x80 | (cp & 0x3F)); }
-            else if (cp < 0x10000) { u[n++] = (char)(0xE0 | (cp >> 12)); u[n++] = (char)(0x80 | ((cp >> 6) & 0x3F)); u[n++] = (char)(0x80 | (cp & 0x3F)); }
-            else { u[n++] = (char)(0xF0 | (cp >> 18)); u[n++] = (char)(0x80 | ((cp >> 12) & 0x3F)); u[n++] = (char)(0x80 | ((cp >> 6) & 0x3F)); u[n++] = (char)(0x80 | (cp & 0x3F)); }
-            result |= lg__type(buf, cap, u, n);
+            result |= lg__type(buf, cap, u, lg__utf8_put(c->chars[i], u));
         }
         if (multi && !by_key && !fixed) {
             for (i = c->key_pressed[LG_KEY_ENTER]; i > 0; i--) result |= lg__type(buf, cap, "\n", 1);
@@ -3559,7 +4302,7 @@ static int lg__edit(unsigned int id, const char *label, char *buf, int cap, int 
             c->undo_kind = 0; result |= LG_INPUT_CHANGED;
         }
         len = (int)strlen(buf);
-        if (!multi && !by_key && c->key_pressed[LG_KEY_ENTER]) { result |= LG_INPUT_ENTER; c->focus = 0; }
+        if (!multi && !by_key && c->key_pressed[LG_KEY_ENTER] && !c->compose[0]) { result |= LG_INPUT_ENTER; c->focus = 0; }
         if (c->key_pressed[LG_KEY_ESCAPE]) c->focus = 0;
     }
 
@@ -3618,12 +4361,30 @@ static int lg__edit(unsigned int id, const char *label, char *buf, int cap, int 
                 lg__fill(lg__r(in.x - scroll + x0, y, x1 - x0, lh), lg__col(LG_COL_TEXT_SELECT));
             }
             lg__text(in.x - scroll, y, buf + a, buf + e, lg__col(LG_COL_TEXT));
-            if (focused && i == caret_row && ((int)(c->time * 2) & 1) == 0)
-                lg__fill(lg__r(in.x - scroll + lg__text_w(buf + a, buf + c->caret), y, 1, lh), lg__col(LG_COL_TEXT));
+            if (focused && i == caret_row) {
+                float cx = in.x - scroll + lg__text_w(buf + a, buf + c->caret);
+                c->ime = lg__r(cx, y, 1, lh);           /* where the system puts its list of candidates */
+                c->ime_frame = c->frame;
+                if (((int)(c->time * 2) & 1) == 0 && !c->compose[0]) lg__fill(lg__r(cx, y, 1, lh), lg__col(LG_COL_TEXT));
+            }
         }
         if (e >= len) break;
     }
     lg__pop_clip();
+    if (focused && c->compose[0] && c->ime_frame == c->frame) {      /* the word an input method is composing, at the caret */
+        const char *t = c->compose, *te = t + strlen(t);
+        int layer = c->layer;
+        float tw = lg__text_w(t, te);
+        lg__rect box = lg__r(c->ime.x - 2, c->ime.y - 1, tw + 4, lh + 2);
+        c->layer = 0x7FFFFFE8;
+        lg__push_clip_raw(lg__r(0, 0, c->w, c->h));
+        lg__fill(box, lg__col(LG_COL_FRAME_HOVER));
+        lg__text(c->ime.x, c->ime.y, t, te, lg__col(LG_COL_TEXT));
+        lg__fill(lg__r(c->ime.x, c->ime.y + lh - 1, tw, 1), lg__col(LG_COL_ACCENT));     /* underlined, as composing text is */
+        if (((int)(c->time * 2) & 1) == 0) lg__fill(lg__r(c->ime.x + lg__text_w(t, t + c->compose_caret), c->ime.y, 1, lh), lg__col(LG_COL_TEXT));
+        lg__pop_clip();
+        c->layer = layer;
+    }
     if (multi) {
         lg_end_panel();
         c->item_rect = b->rect;
@@ -3883,6 +4644,7 @@ LGDEF void lg_soft_render(unsigned char *rgba, int w, int h) {
 
 static GLuint lg__gl_font;
 static const unsigned char *lg__gl_pixels;      /* the font picture that is in the texture */
+static unsigned int lg__gl_version;
 
 LGDEF void lg_gl_init(void) {
     const lg_font *f = lg_get_font();
@@ -3893,6 +4655,7 @@ LGDEF void lg_gl_init(void) {
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_ALPHA, f->width, f->height, 0, GL_ALPHA, GL_UNSIGNED_BYTE, f->pixels);
     lg__gl_pixels = f->pixels;
+    lg__gl_version = f->version;
 }
 LGDEF void lg_gl_shutdown(void) {
     if (lg__gl_font) glDeleteTextures(1, &lg__gl_font);
@@ -3903,7 +4666,7 @@ LGDEF void lg_gl_render(int fb_w, int fb_h) {
     float sx, sy;
     int i;
     if (lg__c.w <= 0 || lg__c.h <= 0 || fb_w <= 0 || fb_h <= 0 || !d->cmd_count) return;
-    if (lg__gl_pixels != lg__c.font.pixels) lg_gl_init();        /* the font was changed (lg_set_font, or another screen scale) */
+    if (lg__gl_pixels != lg__c.font.pixels || lg__gl_version != lg__c.font.version) lg_gl_init();     /* another font, or new characters in it */
     sx = (float)fb_w / lg__c.w; sy = (float)fb_h / lg__c.h;      /* screens where a point is several pixels */
     glPushAttrib(GL_ENABLE_BIT | GL_COLOR_BUFFER_BIT | GL_TRANSFORM_BIT | GL_SCISSOR_BIT | GL_VIEWPORT_BIT | GL_TEXTURE_BIT);
     glPushClientAttrib(GL_CLIENT_VERTEX_ARRAY_BIT);
@@ -4042,8 +4805,42 @@ static void lg__w_begin(float dt) {
 #if defined(_WIN32)
 /* ---------------------------------------------------------------- Win32 */
 #include <windows.h>
+#include <imm.h>
 
-static struct { HWND hwnd; DWORD last; unsigned int high; } lg__w32;
+/* the input method functions come from imm32.dll, loaded when the window opens: nothing more to link */
+typedef HIMC (WINAPI *lg__imm_get)(HWND);
+typedef BOOL (WINAPI *lg__imm_release)(HWND, HIMC);
+typedef BOOL (WINAPI *lg__imm_comp)(HIMC, LPCOMPOSITIONFORM);
+typedef BOOL (WINAPI *lg__imm_cand)(HIMC, LPCANDIDATEFORM);
+
+static struct {
+    HWND hwnd; DWORD last; unsigned int high;
+    HMODULE imm; lg__imm_get get; lg__imm_release release; lg__imm_comp comp; lg__imm_cand cand;
+    POINT spot;
+} lg__w32;
+
+/* the input method's window and its list of candidates go where the caret is */
+static void lg__w32_ime(void) {
+    float x, y, w, h;
+    HIMC ctx;
+    COMPOSITIONFORM cf;
+    CANDIDATEFORM cand;
+    POINT at;
+    if (!lg__w32.get || !lg_ime_rect(&x, &y, &w, &h)) return;
+    at.x = (LONG)(x * lg__w.scale); at.y = (LONG)(y * lg__w.scale);
+    if (at.x == lg__w32.spot.x && at.y == lg__w32.spot.y) return;
+    if ((ctx = lg__w32.get(lg__w32.hwnd)) == 0) return;
+    lg__w32.spot = at;
+    memset(&cf, 0, sizeof cf);
+    cf.dwStyle = CFS_POINT; cf.ptCurrentPos = at;
+    lg__w32.comp(ctx, &cf);
+    memset(&cand, 0, sizeof cand);
+    cand.dwStyle = CFS_EXCLUDE; cand.ptCurrentPos = at;
+    cand.rcArea.left = at.x; cand.rcArea.top = at.y;
+    cand.rcArea.right = at.x + (LONG)(w * lg__w.scale) + 1; cand.rcArea.bottom = at.y + (LONG)(h * lg__w.scale);
+    lg__w32.cand(ctx, &cand);
+    lg__w32.release(lg__w32.hwnd, ctx);
+}
 
 static int lg__w32_key(WPARAM vk) {
     switch (vk) {
@@ -4148,6 +4945,15 @@ LGDEF int lg_window_open(const char *title, int width, int height) {
                                    r.right - r.left, r.bottom - r.top, 0, 0, wc.hInstance, 0);
     if (!lg__w32.hwnd) { lg__w.open = 0; lg_shutdown(); return 0; }
     lg_set_clipboard(lg__w32_get_clip, lg__w32_set_clip, 0);
+    lg__w32.imm = LoadLibraryA("imm32.dll");
+    if (lg__w32.imm) {
+        lg__w32.get = (lg__imm_get)(void (*)(void))GetProcAddress(lg__w32.imm, "ImmGetContext");
+        lg__w32.release = (lg__imm_release)(void (*)(void))GetProcAddress(lg__w32.imm, "ImmReleaseContext");
+        lg__w32.comp = (lg__imm_comp)(void (*)(void))GetProcAddress(lg__w32.imm, "ImmSetCompositionWindow");
+        lg__w32.cand = (lg__imm_cand)(void (*)(void))GetProcAddress(lg__w32.imm, "ImmSetCandidateWindow");
+        if (!lg__w32.release || !lg__w32.comp || !lg__w32.cand) lg__w32.get = 0;
+    }
+    lg__w32.spot.x = lg__w32.spot.y = -1;
     ShowWindow(lg__w32.hwnd, SW_SHOW);
     lg__w32.last = GetTickCount();
     return 1;
@@ -4176,9 +4982,11 @@ LGDEF void lg_window_end_frame(unsigned int background_rgba) {
     bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 32; bi.bmiHeader.biCompression = BI_RGB;
     SetDIBitsToDevice(dc, 0, 0, (DWORD)lg__w.w, (DWORD)lg__w.h, 0, 0, 0, (UINT)lg__w.h, lg__w.px, &bi, DIB_RGB_COLORS);
     ReleaseDC(lg__w32.hwnd, dc);
+    lg__w32_ime();
 }
 LGDEF void lg_window_close(void) {
     if (lg__w32.hwnd) DestroyWindow(lg__w32.hwnd);
+    if (lg__w32.imm) FreeLibrary(lg__w32.imm);
     LOGUIA_FREE(lg__w.px); LOGUIA_FREE(lg__w.clip);
     memset(&lg__w, 0, sizeof lg__w);
     memset(&lg__w32, 0, sizeof lg__w32);
@@ -4247,6 +5055,68 @@ static void lg__mac_draw(id self, SEL cmd, CGRect dirty) {
     CGColorSpaceRelease(space);
 }
 static BOOL lg__mac_yes(id self, SEL cmd) { (void)self; (void)cmd; return YES; }
+
+/* Input methods: the view takes part in the system's text input, so the composing word comes here */
+typedef struct { unsigned long location, length; } lg__mac_range;      /* NSRange */
+static const char *lg__mac_text(id s) {             /* an NSString or an NSAttributedString, as UTF-8 */
+    const char *t;
+    if (!s) return "";
+    if (((BOOL (*)(id, SEL, id))objc_msgSend)(s, sel_registerName("isKindOfClass:"), lg__mac_class("NSAttributedString"))) s = lg__m(s, "string");
+    t = s ? ((const char *(*)(id, SEL))objc_msgSend)(s, sel_registerName("UTF8String")) : 0;
+    return t ? t : "";
+}
+static int lg__mac_byte(const char *t, unsigned long u16) {   /* a place counted in UTF-16 units, as a byte offset */
+    const char *p = t, *e = t + strlen(t);
+    unsigned long n = 0;
+    while (p < e && n < u16) { unsigned int cp; p = lg__utf8(p, e, &cp); n += cp >= 0x10000 ? 2 : 1; }
+    return (int)(p - t);
+}
+static void lg__mac_insert(id self, SEL cmd, id text, lg__mac_range r) {
+    const char *t = lg__mac_text(text), *e = t + strlen(t);
+    (void)self; (void)cmd; (void)r;
+    while (t < e) { unsigned int cp; t = lg__utf8(t, e, &cp); if (cp < 0xF700 || cp > 0xF8FF) lg_input_char(cp); }
+    lg_input_compose(0, 0);
+    lg__w.idle = 3;
+}
+static void lg__mac_set_marked(id self, SEL cmd, id text, lg__mac_range sel, lg__mac_range rep) {
+    const char *t = lg__mac_text(text);
+    (void)self; (void)cmd; (void)rep;
+    lg_input_compose(t, lg__mac_byte(t, sel.location));
+    lg__w.idle = 3;
+}
+static void lg__mac_unmark(id self, SEL cmd) { (void)self; (void)cmd; lg_input_compose(0, 0); lg__w.idle = 3; }
+static BOOL lg__mac_has_marked(id self, SEL cmd) { (void)self; (void)cmd; return lg__c.compose[0] ? YES : NO; }
+static lg__mac_range lg__mac_marked_range(id self, SEL cmd) {
+    lg__mac_range r;
+    const char *p = lg__c.compose, *e = p + strlen(p);
+    (void)self; (void)cmd;
+    r.location = lg__c.compose[0] ? 0 : ~0ul >> 1; r.length = 0;        /* nothing marked: NSNotFound */
+    while (p < e) { unsigned int cp; p = lg__utf8(p, e, &cp); r.length += cp >= 0x10000 ? 2 : 1; }
+    return r;
+}
+static lg__mac_range lg__mac_selected_range(id self, SEL cmd) { lg__mac_range r; (void)self; (void)cmd; r.location = r.length = 0; return r; }
+static id lg__mac_no_attrs(id self, SEL cmd) { (void)self; (void)cmd; return lg__m(lg__mac_class("NSArray"), "array"); }
+static id lg__mac_substring(id self, SEL cmd, lg__mac_range r, lg__mac_range *actual) { (void)self; (void)cmd; (void)r; (void)actual; return 0; }
+static unsigned long lg__mac_char_at(id self, SEL cmd, CGPoint p) { (void)self; (void)cmd; (void)p; return 0; }
+static void lg__mac_command(id self, SEL cmd, SEL what) { (void)self; (void)cmd; (void)what; }   /* keys reach Loguia on their own */
+static CGRect lg__mac_rect_call(id o, const char *sel, CGRect r, id arg, int with_arg) {
+#if defined(__x86_64__)
+    if (with_arg) return ((CGRect (*)(id, SEL, CGRect, id))objc_msgSend_stret)(o, sel_registerName(sel), r, arg);
+    return ((CGRect (*)(id, SEL, CGRect))objc_msgSend_stret)(o, sel_registerName(sel), r);
+#else
+    if (with_arg) return ((CGRect (*)(id, SEL, CGRect, id))objc_msgSend)(o, sel_registerName(sel), r, arg);
+    return ((CGRect (*)(id, SEL, CGRect))objc_msgSend)(o, sel_registerName(sel), r);
+#endif
+}
+/* where on the screen the caret is: the list of candidates opens there */
+static CGRect lg__mac_first_rect(id self, SEL cmd, lg__mac_range r, lg__mac_range *actual) {
+    float x = 0, y = 0, w = 0, h = 0;
+    CGRect v;
+    (void)self; (void)cmd; (void)r; (void)actual;
+    lg_ime_rect(&x, &y, &w, &h);
+    v = lg__mac_rect_call(lg__mac.view, "convertRect:toView:", CGRectMake(x, y, w, h), 0, 1);
+    return lg__mac_rect_call(lg__mac.window, "convertRectToScreen:", v, 0, 0);
+}
 static BOOL lg__mac_should_close(id self, SEL cmd, id sender) { (void)self; (void)cmd; (void)sender; lg__w.open = 0; return NO; }
 
 static const char *lg__mac_get_clip(void *user) {
@@ -4298,9 +5168,12 @@ static void lg__mac_event(id ev) {
         lg_input_key(LG_KEY_SHIFT, (mods & (1ul << 17)) != 0);
         if (key) {
             unsigned int code = ((unsigned short (*)(id, SEL))objc_msgSend)(ev, sel_registerName("keyCode"));
-            lg_input_key(lg__mac_key(code), type == 10);
+            id ctx = lg__m(lg__mac.view, "inputContext");
+            if (type != 10 || !lg__c.compose[0]) lg_input_key(lg__mac_key(code), type == 10);     /* while composing, keys belong to the input method */
             if (type == 10 && (mods & (1ul << 20)) && code == 12) lg__w.open = 0;      /* Command+Q */
-            if (type == 10 && !(mods & ((1ul << 18) | (1ul << 20)))) {
+            if (type == 10 && !(mods & ((1ul << 18) | (1ul << 20))) && ctx) {
+                ((BOOL (*)(id, SEL, id))objc_msgSend)(ctx, sel_registerName("handleEvent:"), ev);     /* text arrives in insertText */
+            } else if (type == 10 && !(mods & ((1ul << 18) | (1ul << 20)))) {
                 id chars = lg__m(ev, "characters");
                 const char *p = chars ? ((const char *(*)(id, SEL))objc_msgSend)(chars, sel_registerName("UTF8String")) : 0, *end;
                 for (end = p ? p + strlen(p) : p; p && p < end;) {
@@ -4329,6 +5202,21 @@ LGDEF int lg_window_open(const char *title, int width, int height) {
         class_addMethod(view_class, sel_registerName("drawRect:"), (IMP)lg__mac_draw, "v@:{CGRect={CGPoint=dd}{CGSize=dd}}");
         class_addMethod(view_class, sel_registerName("isFlipped"), (IMP)lg__mac_yes, "c@:");
         class_addMethod(view_class, sel_registerName("acceptsFirstResponder"), (IMP)lg__mac_yes, "c@:");
+        class_addMethod(view_class, sel_registerName("insertText:replacementRange:"), (IMP)lg__mac_insert, "v@:@{_NSRange=QQ}");
+        class_addMethod(view_class, sel_registerName("setMarkedText:selectedRange:replacementRange:"), (IMP)lg__mac_set_marked, "v@:@{_NSRange=QQ}{_NSRange=QQ}");
+        class_addMethod(view_class, sel_registerName("unmarkText"), (IMP)lg__mac_unmark, "v@:");
+        class_addMethod(view_class, sel_registerName("hasMarkedText"), (IMP)lg__mac_has_marked, "c@:");
+        class_addMethod(view_class, sel_registerName("markedRange"), (IMP)lg__mac_marked_range, "{_NSRange=QQ}@:");
+        class_addMethod(view_class, sel_registerName("selectedRange"), (IMP)lg__mac_selected_range, "{_NSRange=QQ}@:");
+        class_addMethod(view_class, sel_registerName("validAttributesForMarkedText"), (IMP)lg__mac_no_attrs, "@@:");
+        class_addMethod(view_class, sel_registerName("attributedSubstringForProposedRange:actualRange:"), (IMP)lg__mac_substring, "@@:{_NSRange=QQ}^{_NSRange=QQ}");
+        class_addMethod(view_class, sel_registerName("characterIndexForPoint:"), (IMP)lg__mac_char_at, "Q@:{CGPoint=dd}");
+        class_addMethod(view_class, sel_registerName("firstRectForCharacterRange:actualRange:"), (IMP)lg__mac_first_rect, "{CGRect={CGPoint=dd}{CGSize=dd}}@:{_NSRange=QQ}^{_NSRange=QQ}");
+        class_addMethod(view_class, sel_registerName("doCommandBySelector:"), (IMP)lg__mac_command, "v@::");
+        {
+            Protocol *text_input = objc_getProtocol("NSTextInputClient");
+            if (text_input) class_addProtocol(view_class, text_input);
+        }
         objc_registerClassPair(view_class);
         delegate_class = objc_allocateClassPair(objc_getClass("NSObject"), "LoguiaDelegate", 0);
         class_addMethod(delegate_class, sel_registerName("windowShouldClose:"), (IMP)lg__mac_should_close, "c@:@");
@@ -4451,6 +5339,16 @@ static const struct wl_interface lg__shape_mgr_if = { "wp_cursor_shape_manager_v
 static const struct wl_message lg__shape_req[] = { LG__WL_M("destroy", ""), LG__WL_M("set_shape", "uu") };
 static const struct wl_interface lg__shape_if = { "wp_cursor_shape_device_v1", 1, 2, lg__shape_req, 0, 0 };
 
+/* input methods: the program tells where the caret is, the compositor tells what is being composed */
+static const struct wl_message lg__ti_mgr_req[] = { LG__WL_M("destroy", ""), LG__WL_M("get_text_input", "no") };
+static const struct wl_interface lg__ti_mgr_if = { "zwp_text_input_manager_v3", 1, 2, lg__ti_mgr_req, 0, 0 };
+static const struct wl_message lg__ti_req[] = { LG__WL_M("destroy", ""), LG__WL_M("enable", ""), LG__WL_M("disable", ""),
+    LG__WL_M("set_surrounding_text", "sii"), LG__WL_M("set_text_change_cause", "u"), LG__WL_M("set_content_type", "uu"),
+    LG__WL_M("set_cursor_rectangle", "iiii"), LG__WL_M("commit", "") };
+static const struct wl_message lg__ti_ev[] = { LG__WL_M("enter", "o"), LG__WL_M("leave", "o"), LG__WL_M("preedit_string", "?sii"),
+    LG__WL_M("commit_string", "?s"), LG__WL_M("delete_surrounding_text", "uu"), LG__WL_M("done", "u") };
+static const struct wl_interface lg__ti_if = { "zwp_text_input_v3", 1, 8, lg__ti_req, 6, lg__ti_ev };
+
 typedef struct { struct wl_buffer *buf; unsigned char *data; size_t size; int w, h, busy; } lg__wl_buf;
 
 static struct {
@@ -4467,6 +5365,9 @@ static struct {
     struct wl_data_source *source;          /* set while the clipboard holds our text */
     struct wl_data_offer *offer, *fresh;    /* the clipboard of another program; the offer that was announced last */
     struct wl_proxy *wm_base, *xdg_surface, *toplevel, *deco_mgr, *deco, *viewporter, *viewport, *frac_mgr, *frac, *shape_mgr, *shape;
+    struct wl_proxy *ti_mgr, *ti;
+    int ti_in, ti_on, ti_caret, ti_rect[4];
+    char *ti_pre, *ti_commit;           /* what arrived since the last "done" */
     struct xkb_context *xkb;
     struct xkb_keymap *keymap;
     struct xkb_state *state;
@@ -4496,6 +5397,66 @@ static void lg__wl_resize(void) {
     int w = (int)((float)lg__wl.lw * lg__w.scale + 0.5f), h = (int)((float)lg__wl.lh * lg__w.scale + 0.5f);
     if (w != lg__w.w || h != lg__w.h || !lg__w.px) lg__w_size(w, h);
     lg__w.idle = 3;
+}
+
+/* --- input methods */
+static char *lg__wl_copy(const char *t) {
+    size_t n = t ? strlen(t) : 0;
+    char *c = (char *)LOGUIA_MALLOC(n + 1);
+    if (n) memcpy(c, t, n);
+    c[n] = 0;
+    return c;
+}
+static void lg__wl_ti_enter(void *d, struct wl_proxy *t, struct wl_surface *s) { (void)d; (void)t; (void)s; lg__wl.ti_in = 1; lg__wl.ti_on = 0; lg__w.idle = 3; }
+static void lg__wl_ti_leave(void *d, struct wl_proxy *t, struct wl_surface *s) {
+    (void)d; (void)s;
+    if (lg__wl.ti_on) { wl_proxy_marshal_flags(t, 2, 0, 1, 0); wl_proxy_marshal_flags(t, 7, 0, 1, 0); }       /* disable, commit */
+    lg__wl.ti_in = lg__wl.ti_on = 0;
+    lg_input_compose(0, 0);
+    lg__w.idle = 3;
+}
+static void lg__wl_ti_preedit(void *d, struct wl_proxy *t, const char *text, int32_t begin, int32_t end) {
+    (void)d; (void)t; (void)end;
+    LOGUIA_FREE(lg__wl.ti_pre);
+    lg__wl.ti_pre = text ? lg__wl_copy(text) : 0;
+    lg__wl.ti_caret = begin;
+}
+static void lg__wl_ti_commit(void *d, struct wl_proxy *t, const char *text) {
+    (void)d; (void)t;
+    LOGUIA_FREE(lg__wl.ti_commit);
+    lg__wl.ti_commit = text ? lg__wl_copy(text) : 0;
+}
+static void lg__wl_ti_delete(void *d, struct wl_proxy *t, uint32_t before, uint32_t after) { (void)d; (void)t; (void)before; (void)after; }
+static void lg__wl_ti_done(void *d, struct wl_proxy *t, uint32_t serial) {
+    (void)d; (void)t; (void)serial;
+    if (lg__wl.ti_commit) {             /* the finished text, typed as if from the keyboard */
+        const char *p = lg__wl.ti_commit, *e = p + strlen(p);
+        while (p < e) { unsigned int cp; p = lg__utf8(p, e, &cp); lg_input_char(cp); }
+    }
+    lg_input_compose(lg__wl.ti_pre, lg__wl.ti_pre ? lg__wl.ti_caret : 0);
+    LOGUIA_FREE(lg__wl.ti_pre); LOGUIA_FREE(lg__wl.ti_commit);
+    lg__wl.ti_pre = lg__wl.ti_commit = 0;
+    lg__w.idle = 3;
+}
+static void (*lg__wl_ti_l[])(void) = { (void (*)(void))lg__wl_ti_enter, (void (*)(void))lg__wl_ti_leave, (void (*)(void))lg__wl_ti_preedit,
+                                       (void (*)(void))lg__wl_ti_commit, (void (*)(void))lg__wl_ti_delete, (void (*)(void))lg__wl_ti_done };
+/* turned on while a text field is being typed into, with the caret's place for the list of candidates */
+static void lg__wl_ime(void) {
+    float x = 0, y = 0, w = 0, h = 0;
+    int on = lg__wl.ti && lg__wl.ti_in && lg_ime_rect(&x, &y, &w, &h), changed = 0, r[4];
+    if (!lg__wl.ti) return;
+    if (on != lg__wl.ti_on) {
+        wl_proxy_marshal_flags(lg__wl.ti, on ? 1 : 2, 0, 1, 0);
+        lg__wl.ti_on = on; changed = 1;
+        lg__wl.ti_rect[2] = -1;
+    }
+    r[0] = (int)x; r[1] = (int)y; r[2] = (int)w + 1; r[3] = (int)h;
+    if (on && memcmp(r, lg__wl.ti_rect, sizeof r) != 0) {
+        wl_proxy_marshal_flags(lg__wl.ti, 6, 0, 1, 0, r[0], r[1], r[2], r[3]);
+        memcpy(lg__wl.ti_rect, r, sizeof r);
+        changed = 1;
+    }
+    if (changed) wl_proxy_marshal_flags(lg__wl.ti, 7, 0, 1, 0);
 }
 
 /* --- the window */
@@ -4804,6 +5765,7 @@ static void lg__wl_global(void *d, struct wl_registry *r, uint32_t name, const c
     else if (strcmp(iface, "wp_viewporter") == 0) lg__wl.viewporter = (struct wl_proxy *)wl_registry_bind(r, name, &lg__viewporter_if, 1);
     else if (strcmp(iface, "wp_fractional_scale_manager_v1") == 0) lg__wl.frac_mgr = (struct wl_proxy *)wl_registry_bind(r, name, &lg__frac_mgr_if, 1);
     else if (strcmp(iface, "wp_cursor_shape_manager_v1") == 0) lg__wl.shape_mgr = (struct wl_proxy *)wl_registry_bind(r, name, &lg__shape_mgr_if, 1);
+    else if (strcmp(iface, "zwp_text_input_manager_v3") == 0) lg__wl.ti_mgr = (struct wl_proxy *)wl_registry_bind(r, name, &lg__ti_mgr_if, 1);
 }
 static void lg__wl_global_gone(void *d, struct wl_registry *r, uint32_t name) { (void)d; (void)r; (void)name; }
 
@@ -4816,6 +5778,7 @@ static void lg__wl_close(void) {
         if (lg__wl.xkb) xkb_context_unref(lg__wl.xkb);
         if (lg__wl.source) wl_data_source_destroy(lg__wl.source);
         if (lg__wl.offer) wl_data_offer_destroy(lg__wl.offer);
+        LOGUIA_FREE(lg__wl.ti_pre); LOGUIA_FREE(lg__wl.ti_commit);
         if (lg__wl.toplevel) wl_proxy_marshal_flags(lg__wl.toplevel, 0, 0, lg__wl_ver(lg__wl.toplevel), WL_MARSHAL_FLAG_DESTROY);
         if (lg__wl.xdg_surface) wl_proxy_marshal_flags(lg__wl.xdg_surface, 0, 0, lg__wl_ver(lg__wl.xdg_surface), WL_MARSHAL_FLAG_DESTROY);
         if (lg__wl.surface) wl_surface_destroy(lg__wl.surface);
@@ -4880,6 +5843,10 @@ static int lg__wl_open(const char *title, int width, int height) {
         lg__wl.data_dev = wl_data_device_manager_get_data_device(lg__wl.data_mgr, lg__wl.seat);
         wl_data_device_add_listener(lg__wl.data_dev, &lg__wl.device_l, 0);
     }
+    if (lg__wl.ti_mgr && lg__wl.seat) {
+        lg__wl.ti = wl_proxy_marshal_flags(lg__wl.ti_mgr, 1, &lg__ti_if, 1, 0, (void *)0, lg__wl.seat);
+        wl_proxy_add_listener(lg__wl.ti, lg__wl_ti_l, 0);
+    }
     wl_surface_commit(lg__wl.surface);
     for (tries = 0; tries < 20 && !lg__wl.configured; tries++) if (wl_display_roundtrip(d) < 0) break;     /* the compositor says how big the window is */
     if (!lg__wl.configured) { lg__wl_close(); return 0; }
@@ -4935,6 +5902,7 @@ static void lg__wl_end_frame(unsigned int background_rgba) {
         wl_surface_commit(lg__wl.surface);
         b->busy = 1;
     }
+    lg__wl_ime();
     wl_display_flush(lg__wl.display);
 }
 #endif /* LOGUIA_WAYLAND */
@@ -4946,6 +5914,8 @@ static void lg__wl_end_frame(unsigned int background_rgba) {
 #include <X11/Xatom.h>
 #include <X11/keysym.h>
 #include <locale.h>
+#include <stdlib.h>
+#include <wchar.h>
 
 static struct {
     Display *dpy;
@@ -4954,6 +5924,10 @@ static struct {
     XImage *img;
     XIM im;
     XIC ic;
+    XIMCallback pe_cb[4];           /* the input method tells what it is composing (start, done, draw, caret) */
+    unsigned int pe[256];
+    int pe_len, pe_caret;
+    XPoint spot;
     Atom wm_delete, clipboard, utf8, targets, prop;
     int bgr;
     struct timespec last;
@@ -4980,6 +5954,72 @@ static int lg__x_key(KeySym k) {
     case XK_z: return LG_KEY_Z;                 case XK_y: return LG_KEY_Y;
     }
     return LG_KEY_NONE;
+}
+/* the word being composed, as the input method describes it piece by piece */
+static void lg__x_compose(void) {
+    char out[256 * 4 + 1];
+    int n = 0, i, caret = -1;
+    for (i = 0; i < lg__x.pe_len && n < (int)sizeof out - 5; i++) {
+        if (i == lg__x.pe_caret) caret = n;
+        n += lg__utf8_put(lg__x.pe[i], out + n);
+    }
+    out[n] = 0;
+    lg_input_compose(out, caret);
+    lg__w.idle = 3;
+}
+static int lg__x_pe_start(XIC ic, XPointer user, XPointer data) { (void)ic; (void)user; (void)data; lg__x.pe_len = lg__x.pe_caret = 0; return -1; }
+static void lg__x_pe_done(XIC ic, XPointer user, XPointer data) { (void)ic; (void)user; (void)data; lg__x.pe_len = lg__x.pe_caret = 0; lg__x_compose(); }
+static void lg__x_pe_draw(XIC ic, XPointer user, XPointer data) {
+    XIMPreeditDrawCallbackStruct *d = (XIMPreeditDrawCallbackStruct *)data;
+    unsigned int add[256];
+    int n = 0, first = d->chg_first, len = d->chg_length, i, keep;
+    (void)ic; (void)user;
+    if (d->text && d->text->encoding_is_wchar && d->text->string.wide_char)
+        for (i = 0; i < d->text->length && n < 256; i++) add[n++] = (unsigned int)d->text->string.wide_char[i];
+    else if (d->text && !d->text->encoding_is_wchar && d->text->string.multi_byte) {
+        wchar_t wide[256];
+        int k = (int)mbstowcs(wide, d->text->string.multi_byte, 256);
+        for (i = 0; i < k && n < 256; i++) add[n++] = (unsigned int)wide[i];
+    }
+    if (first < 0) first = 0;
+    if (first > lg__x.pe_len) first = lg__x.pe_len;
+    if (len < 0) len = 0;
+    if (len > lg__x.pe_len - first) len = lg__x.pe_len - first;
+    keep = lg__x.pe_len - first - len;
+    if (first + n + keep > 256) n = 256 - first - keep;
+    memmove(lg__x.pe + first + n, lg__x.pe + first + len, (size_t)keep * sizeof *lg__x.pe);
+    memcpy(lg__x.pe + first, add, (size_t)n * sizeof *add);
+    lg__x.pe_len = first + n + keep;
+    lg__x.pe_caret = d->caret < 0 ? 0 : d->caret > lg__x.pe_len ? lg__x.pe_len : d->caret;
+    lg__x_compose();
+}
+static void lg__x_pe_caret(XIC ic, XPointer user, XPointer data) {
+    XIMPreeditCaretCallbackStruct *c = (XIMPreeditCaretCallbackStruct *)data;
+    int at = lg__x.pe_caret;
+    (void)ic; (void)user;
+    switch (c->direction) {
+    case XIMForwardChar: at++; break;
+    case XIMBackwardChar: at--; break;
+    case XIMLineStart: at = 0; break;
+    case XIMLineEnd: at = lg__x.pe_len; break;
+    case XIMAbsolutePosition: at = c->position; break;
+    default: break;
+    }
+    lg__x.pe_caret = c->position = at < 0 ? 0 : at > lg__x.pe_len ? lg__x.pe_len : at;
+    lg__x_compose();
+}
+/* the input method's list of candidates goes where the caret is */
+static void lg__x_ime(void) {
+    float x, y, w, h;
+    XPoint at;
+    XVaNestedList list;
+    if (!lg__x.ic || !lg_ime_rect(&x, &y, &w, &h)) return;
+    at.x = (short)(x * lg__w.scale); at.y = (short)((y + h) * lg__w.scale);
+    if (at.x == lg__x.spot.x && at.y == lg__x.spot.y) return;
+    lg__x.spot = at;
+    list = XVaCreateNestedList(0, XNSpotLocation, &at, (char *)0);
+    XSetICValues(lg__x.ic, XNPreeditAttributes, list, (char *)0);
+    XFree(list);
 }
 static void lg__x_resize(int w, int h) {
     if (lg__x.img) { lg__x.img->data = 0; XDestroyImage(lg__x.img); }       /* the pixels are ours, not Xlib's */
@@ -5036,7 +6076,11 @@ static void lg__x_event(XEvent *ev) {
     case KeyRelease: lg_input_key(lg__x_key(XLookupKeysym(&ev->xkey, 0)), 0); break;
     case MappingNotify: XRefreshKeyboardMapping(&ev->xmapping); break;      /* the keyboard layout changed */
     case DestroyNotify: lg__w.open = 0; break;
-    case FocusOut: lg_input_key(LG_KEY_CTRL, 0); lg_input_key(LG_KEY_SHIFT, 0); break;
+    case FocusIn: if (lg__x.ic) XSetICFocus(lg__x.ic); break;
+    case FocusOut:
+        lg_input_key(LG_KEY_CTRL, 0); lg_input_key(LG_KEY_SHIFT, 0);
+        if (lg__x.ic) XUnsetICFocus(lg__x.ic);
+        break;
     case SelectionRequest: lg__x_give(&ev->xselectionrequest); break;
     }
 }
@@ -5109,7 +6153,36 @@ static int lg__x_open(const char *title, int width, int height) {
     lg__x.gc = XCreateGC(d, lg__x.win, 0, 0);
     XSetLocaleModifiers("");
     lg__x.im = XOpenIM(d, 0, 0, 0);
-    if (lg__x.im) lg__x.ic = XCreateIC(lg__x.im, XNInputStyle, XIMPreeditNothing | XIMStatusNothing, XNClientWindow, lg__x.win, XNFocusWindow, lg__x.win, (char *)0);
+    if (lg__x.im) {
+        /* Input methods (Chinese, Japanese, Korean...): best when they tell us what they are composing,
+           so Loguia shows it at the caret; otherwise they show it in a little window of their own. */
+        XIMStyles *styles = 0;
+        int told = 0, i;
+        long mask = 0;
+        if (XGetIMValues(lg__x.im, XNQueryInputStyle, &styles, (char *)0) == 0 && styles) {
+            for (i = 0; i < styles->count_styles; i++) if (styles->supported_styles[i] == (XIMPreeditCallbacks | XIMStatusNothing)) told = 1;
+            XFree(styles);
+        }
+        if (told) {
+            XVaNestedList pe;
+            lg__x.pe_cb[0].callback = (XIMProc)(void (*)(void))lg__x_pe_start;
+            lg__x.pe_cb[1].callback = (XIMProc)(void (*)(void))lg__x_pe_done;      /* they get the XIC, whatever XIMProc says */
+            lg__x.pe_cb[2].callback = (XIMProc)(void (*)(void))lg__x_pe_draw;
+            lg__x.pe_cb[3].callback = (XIMProc)(void (*)(void))lg__x_pe_caret;
+            pe = XVaCreateNestedList(0, XNPreeditStartCallback, &lg__x.pe_cb[0], XNPreeditDoneCallback, &lg__x.pe_cb[1],
+                                     XNPreeditDrawCallback, &lg__x.pe_cb[2], XNPreeditCaretCallback, &lg__x.pe_cb[3], (char *)0);
+            lg__x.ic = XCreateIC(lg__x.im, XNInputStyle, XIMPreeditCallbacks | XIMStatusNothing, XNClientWindow, lg__x.win,
+                                 XNFocusWindow, lg__x.win, XNPreeditAttributes, pe, (char *)0);
+            XFree(pe);
+        }
+        if (!lg__x.ic) lg__x.ic = XCreateIC(lg__x.im, XNInputStyle, XIMPreeditNothing | XIMStatusNothing, XNClientWindow, lg__x.win, XNFocusWindow, lg__x.win, (char *)0);
+        if (lg__x.ic) {             /* the input method may want to see more events than the window asked for */
+            XGetICValues(lg__x.ic, XNFilterEvents, &mask, (char *)0);
+            XSelectInput(d, lg__x.win, ExposureMask | StructureNotifyMask | KeyPressMask | KeyReleaseMask | ButtonPressMask |
+                         ButtonReleaseMask | PointerMotionMask | FocusChangeMask | mask);
+            XSetICFocus(lg__x.ic);
+        }
+    }
     lg_init();
     lg_set_clipboard(lg__x_get_clip, lg__x_set_clip, 0);
     lg__x_resize((int)((float)width * lg__w.scale), (int)((float)height * lg__w.scale));
@@ -5143,6 +6216,7 @@ static int lg__x_begin_frame(void) {
 static void lg__x_end_frame(unsigned int background_rgba) {
     lg__w_draw(background_rgba, lg__x.bgr);
     XPutImage(lg__x.dpy, lg__x.win, lg__x.gc, lg__x.img, 0, 0, 0, 0, (unsigned int)lg__w.w, (unsigned int)lg__w.h);
+    lg__x_ime();
     XFlush(lg__x.dpy);
 }
 static void lg__x_close(void) {

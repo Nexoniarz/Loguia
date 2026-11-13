@@ -391,6 +391,72 @@ static void docking(const char *dir) {
     CHECK(lg_dock_save(text, (int)sizeof text) > 0 && strchr(text, 'N') == strrchr(text, 'N'));     /* only the screen itself is left */
 }
 
+/* an input method composes a word at the caret, then hands over the finished text */
+static void compose(const char *dir) {
+    float x, y, w, h, fx, fy, fw, fh;
+    click(st.at_input_x, st.at_input_y);
+    lg_input_key(LG_KEY_CTRL, 1); key(LG_KEY_A); lg_input_key(LG_KEY_CTRL, 0);
+    type("Ja: ");
+    lg_input_compose("\xE3\x81\xAB\xE3\x81\xBB\xE3\x82\x93", 6);      /* にほん, the caret before ん */
+    frame();
+    shot(dir, "20-composing");
+    CHECK(lg_ime_rect(&x, &y, &w, &h));
+    fx = st.at_input_x - 12; fy = st.at_input_y - lg_line_height() / 2 - lg_get_style()->padding_y;
+    fw = 200; fh = lg_line_height() + 2 * lg_get_style()->padding_y;
+    CHECK(x > fx + lg_text_width("Ja:") && x < fx + fw && y >= fy && y + h <= fy + fh);
+    CHECK(strcmp(st.name, "Ja: ") == 0);                                 /* nothing is in the text until it is finished */
+    key(LG_KEY_ENTER);                                                   /* Enter belongs to the input method while it composes */
+    CHECK(lg_wants_keyboard());
+    lg_input_compose(NULL, 0);
+    lg_input_char(0x65E5); lg_input_char(0x672C); frame();               /* 日本 */
+    CHECK(strcmp(st.name, "Ja: \xE6\x97\xA5\xE6\x9C\xAC") == 0);
+    key(LG_KEY_ESCAPE);
+    CHECK(!lg_ime_rect(0, 0, 0, 0));
+}
+
+/* fonts loaded from files, at any size: argv[2...] are font files to try */
+static void fonts(const char *dir, int count, char **paths) {
+    lg_font builtin = *lg_get_font();
+    int i;
+    for (i = 0; i < count; i++) {
+        char name[64];
+        lg_font *f = lg_font_load_file(paths[i], 15 + 3 * (float)i);
+        int cjk;
+        CHECK(f != 0);
+        if (!f) continue;
+        if (i == count - 1 && count > 1) {          /* the last font gets the first one behind it, for what it lacks */
+            lg_font *back = lg_font_load_file(paths[0], 15);
+            lg_font_fallback(f, back);
+            lg_set_font(f);
+            strcpy(st.name, "Zażółć 日本語 한국어");
+            frame(); frame();
+            CHECK(lg_text_width("\xC5\xBC") != lg_text_width("?"));         /* ż comes from the font behind */
+            shot(dir, "23-fallback");
+            lg_font_fallback(f, NULL);
+            lg_font_free(back);
+        }
+        lg_set_font(f);
+        strcpy(st.name, "Zażółć 日本語 한국어");
+        frame(); frame();
+        CHECK(lg_get_font()->glyph_count > 20);
+        CHECK(lg_text_width("Ag") > 0 && lg_line_height() >= 15 + 3 * i);
+        cjk = lg_text_width("\xE6\x97\xA5") != lg_text_width("?");
+        snprintf(name, sizeof name, "21-font-%d%s", i, cjk ? "-cjk" : "");
+        shot(dir, name);
+        lg_set_pixel_scale(2);                                           /* drawn again, sharp, for a HiDPI screen */
+        frame(); frame();
+        CHECK(lg_get_font()->scale == 2);
+        snprintf(name, sizeof name, "22-font-%d-2x", i);
+        shot_at(dir, name, 2);
+        lg_set_pixel_scale(1);
+        lg_font_free(f);
+        CHECK(lg_get_font()->source == 0);                               /* freeing it went back to the built-in font */
+    }
+    CHECK(lg_font_load("not a font at all", 17, 15) == 0);
+    lg_set_font(&builtin);
+    frame();
+}
+
 int main(int argc, char **argv) {
     const char *dir = argc > 1 ? argv[1] : ".";
     lg_init();
@@ -442,6 +508,7 @@ int main(int argc, char **argv) {
 
     more(dir);
     newer(dir);
+    compose(dir);
 
     /* windows: drag the second one by its title, then it is on top and has moved */
     drag(st.win2_x + 60, st.win2_y + 10, st.win2_x - 140, st.win2_y + 90);
@@ -476,6 +543,7 @@ int main(int argc, char **argv) {
         CHECK(lg_get_font()->scale == 1);
     }
 
+    fonts(dir, argc > 2 ? argc - 2 : 0, argv + 2);
     lg_shutdown();
     if (failures) { printf("%d check(s) failed\n", failures); return 1; }
     printf("all checks passed\n");
