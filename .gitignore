@@ -1,0 +1,8 @@
+demo
+*.exe
+*.o
+examples/headless
+examples/demo_window
+examples/demo
+*.png
+*.ppm
